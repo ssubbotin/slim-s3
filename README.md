@@ -111,6 +111,18 @@ bool retryable(const slims3::Error& e) {
 }
 ```
 
+## Thread safety
+
+A `Client` runs one operation at a time — don't share an instance between
+threads; create one per worker thread instead (they're cheap: the persistent
+curl handle is essentially the only state). The one exception is `cancel()`,
+which is safe to call from any thread and aborts the operation currently
+running on that client. Separate instances are fully independent — no shared
+global state (`curl_global_init` is handled once, thread-safely). Progress and
+write callbacks run on the thread that called the operation.
+
+See [docs/DESIGN.md](docs/DESIGN.md) §7 for the full concurrency model.
+
 ## Why
 
 - **aws-sdk-cpp** brings the aws-crt dependency tree and slow builds for what is,
