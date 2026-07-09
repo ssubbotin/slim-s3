@@ -28,16 +28,32 @@ struct CbCtx {
     std::atomic<bool>* cancel = nullptr;
     bool aborted = false;
     bool overflowed = false;
+    bool headersOverflowed = false;
     bool metaFilled = false;
     std::size_t bodyOff = 0;
+    std::size_t headerBytes = 0;
 };
+
+// Caps against a malicious/misbehaving server streaming endless response
+// headers: a per-line count cap and a cumulative-bytes cap. Both are well
+// past anything a real S3-compatible server sends.
+constexpr std::size_t kMaxHeaderCount = 2000;
+constexpr std::size_t kMaxHeaderBytes = 1 * 1024 * 1024;
 
 size_t onHeader(char* buf, size_t size, size_t nitems, void* ud) {
     auto* ctx = static_cast<CbCtx*>(ud);
-    std::string line(buf, size * nitems);
+    size_t len = size * nitems;
+    std::string line(buf, len);
     if (line.rfind("HTTP/", 0) == 0) {
         ctx->resp->headers.clear(); // new response block (e.g. after redirect)
-        return size * nitems;
+        ctx->headerBytes = 0;
+        return len;
+    }
+    ctx->headerBytes += len;
+    if (ctx->resp->headers.size() >= kMaxHeaderCount || ctx->headerBytes > kMaxHeaderBytes) {
+        ctx->overflowed = true;
+        ctx->headersOverflowed = true;
+        return 0; // abort the transfer, same path as the body-size cap
     }
     auto colon = line.find(':');
     if (colon != std::string::npos) {
@@ -50,7 +66,7 @@ size_t onHeader(char* buf, size_t size, size_t nitems, void* ud) {
             value.pop_back();
         ctx->resp->headers.emplace_back(std::move(name), std::move(value));
     }
-    return size * nitems;
+    return len;
 }
 
 size_t onWrite(char* buf, size_t size, size_t nmemb, void* ud) {
@@ -184,15 +200,33 @@ void metaFromHeaders(const HttpResponse& r, slims3::ObjectMeta& m) {
     }
 }
 
+// Holds only the Config fields the transport layer actually reads. In
+// particular this deliberately does NOT copy accessKey/secretKey/region/
+// endpoint: there is no reason for a second live copy of the secret key to
+// sit around in this object once Transport is constructed (signing reads
+// Config directly in client.cpp). Full zeroization of Config's own copy is
+// out of scope for v1.
 struct TransportState {
     CURL* handle = nullptr;
-    slims3::Config cfg;
+    long connectTimeoutSec = 30;
+    long operationTimeoutSec = 0;
+    long lowSpeedLimitBps = 1;
+    long lowSpeedTimeSec = 60;
+    std::string caBundlePath;
+    bool tlsVerify = true;
+    std::string userAgent;
 };
 
 Transport::Transport(const slims3::Config& cfg) {
     globalInitOnce();
     auto* st = new TransportState;
-    st->cfg = cfg;
+    st->connectTimeoutSec = cfg.connectTimeoutSec;
+    st->operationTimeoutSec = cfg.operationTimeoutSec;
+    st->lowSpeedLimitBps = cfg.lowSpeedLimitBps;
+    st->lowSpeedTimeSec = cfg.lowSpeedTimeSec;
+    st->caBundlePath = cfg.caBundlePath;
+    st->tlsVerify = cfg.tlsVerify;
+    st->userAgent = cfg.userAgent;
     st->handle = curl_easy_init();
     state_ = st;
 }
@@ -240,15 +274,15 @@ int Transport::execute(const HttpRequest& req, HttpResponse& resp, std::atomic<b
     curl_easy_setopt(h, CURLOPT_URL, req.url.c_str());
     curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 0L);
-    curl_easy_setopt(h, CURLOPT_USERAGENT, st->cfg.userAgent.c_str());
-    curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, st->cfg.connectTimeoutSec);
-    curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, st->cfg.lowSpeedLimitBps);
-    curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, st->cfg.lowSpeedTimeSec);
-    if (st->cfg.operationTimeoutSec > 0)
-        curl_easy_setopt(h, CURLOPT_TIMEOUT, st->cfg.operationTimeoutSec);
-    if (!st->cfg.caBundlePath.empty())
-        curl_easy_setopt(h, CURLOPT_CAINFO, st->cfg.caBundlePath.c_str());
-    if (!st->cfg.tlsVerify) {
+    curl_easy_setopt(h, CURLOPT_USERAGENT, st->userAgent.c_str());
+    curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, st->connectTimeoutSec);
+    curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, st->lowSpeedLimitBps);
+    curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, st->lowSpeedTimeSec);
+    if (st->operationTimeoutSec > 0)
+        curl_easy_setopt(h, CURLOPT_TIMEOUT, st->operationTimeoutSec);
+    if (!st->caBundlePath.empty())
+        curl_easy_setopt(h, CURLOPT_CAINFO, st->caBundlePath.c_str());
+    if (!st->tlsVerify) {
         curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 0L);
         curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, 0L);
     }
@@ -295,7 +329,8 @@ int Transport::execute(const HttpRequest& req, HttpResponse& resp, std::atomic<b
         // aborted stays false: this must map to ErrorKind::transport, not
         // ErrorKind::cancelled (which is reserved for user/cancel-flag/sink
         // refusal aborts).
-        curlError = "response body exceeded the 8 MiB in-memory cap";
+        curlError = ctx.headersOverflowed ? "response headers exceeded limit"
+                                          : "response body exceeded the 8 MiB in-memory cap";
     }
     return int(rc);
 }

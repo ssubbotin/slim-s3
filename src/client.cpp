@@ -6,6 +6,11 @@
 #include <fstream>
 #include <iterator>
 
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 #include "client_detail.hpp"
 #include "sha256.hpp"
 #include "signer.hpp"
@@ -19,6 +24,19 @@ namespace slims3 {
 using namespace detail;
 
 namespace detail {
+
+namespace {
+// Replaces control characters (bytes < 0x20, and DEL) with '.' before an
+// attacker-controlled body snippet is copied into a human-readable Error
+// message -- keeps CRLF / terminal escape sequences out of downstream logs.
+std::string sanitizeForLog(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s)
+        out.push_back((c < 0x20 || c == 0x7F) ? '.' : char(c));
+    return out;
+}
+} // namespace
 
 Error mapError(int curlCode, bool aborted, const std::string& curlError, const HttpResponse& resp,
                const std::string& headSynthCode) {
@@ -47,8 +65,9 @@ Error mapError(int curlCode, bool aborted, const std::string& curlError, const H
             e.message = headSynthCode;
         } else {
             e.kind = ErrorKind::http;
-            e.message = "HTTP " + std::to_string(resp.status) +
-                        (resp.body.empty() ? "" : (": " + resp.body.substr(0, 200)));
+            e.message =
+                "HTTP " + std::to_string(resp.status) +
+                (resp.body.empty() ? "" : (": " + sanitizeForLog(resp.body.substr(0, 200))));
         }
         return e;
     }
@@ -229,6 +248,22 @@ Result Client::putObject(const std::string& bucket, const std::string& key, cons
     impl_->cancel.store(false);
     if (data == nullptr && len > 0)
         return Result{Error{ErrorKind::transport, 0, "", "null data with non-zero length", 0}, 0};
+    // Reject header injection before it reaches the wire (and the signed
+    // canonical request): an app forwarding untrusted x-amz-meta-* values (or
+    // a content-type/content-encoding with an embedded CR/LF) must not be
+    // able to smuggle extra header lines or corrupt the signature.
+    static const Result kInvalidHeader{
+        Error{ErrorKind::transport, 0, "", "invalid header (control characters not allowed)", 0},
+        0};
+    if (!opts.contentType.empty() && !validHeaderToken(opts.contentType, /*isName=*/false))
+        return kInvalidHeader;
+    if (!opts.contentEncoding.empty() && !validHeaderToken(opts.contentEncoding, /*isName=*/false))
+        return kInvalidHeader;
+    for (const auto& kv : opts.extraHeaders) {
+        if (!validHeaderToken(kv.first, /*isName=*/true) ||
+            !validHeaderToken(kv.second, /*isName=*/false))
+            return kInvalidHeader;
+    }
     Impl::Op op;
     op.method = "PUT";
     op.bucket = bucket;
@@ -291,9 +326,29 @@ Result Client::getToFile(const std::string& bucket, const std::string& key,
                          const std::string& filePath, const ProgressFn& progress,
                          ObjectMeta* meta) {
     const std::string part = filePath + ".part";
+#ifdef _WIN32
+    // v1 has no Windows equivalent of O_EXCL|O_NOFOLLOW handy; fall back to
+    // the plain fopen path there (this library targets Linux CI for v1).
     std::FILE* f = std::fopen(part.c_str(), "wb");
     if (!f)
         return Result{Error{ErrorKind::transport, 0, "", "cannot open file: " + part, 0}, 0};
+#else
+    // Exclusive, symlink-refusing open: a local attacker who pre-plants
+    // `<file>.part` (e.g. as a symlink to a victim file) must not be able to
+    // get it clobbered by a following fopen(...,"wb"). A stale leftover
+    // `.part` from a previous crashed download now blocks the new download
+    // instead of being silently truncated -- safer, and reported below.
+    int fd = ::open(part.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    if (fd < 0)
+        return Result{Error{ErrorKind::transport, 0, "",
+                            "cannot create temp file (already exists?): " + part, 0},
+                      0};
+    std::FILE* f = ::fdopen(fd, "wb");
+    if (!f) {
+        ::close(fd);
+        return Result{Error{ErrorKind::transport, 0, "", "cannot open file: " + part, 0}, 0};
+    }
+#endif
     bool writeFailed = false;
     WriteFn sink = [f, &writeFailed](const char* data, std::size_t len) {
         if (std::fwrite(data, 1, len, f) != len) {
@@ -328,7 +383,13 @@ Result Client::listObjects(const std::string& bucket, const std::string& prefix,
                            const ListFn& onObject) {
     impl_->cancel.store(false);
     std::string token;
-    while (true) {
+    // Hard cap on the number of ListObjectsV2 pages fetched for a single call:
+    // a per-request timeout doesn't bound the whole (paginated) operation, and
+    // a server handing out a fresh continuation-token forever would otherwise
+    // loop indefinitely. 100k pages * 1000 keys/page = 100M objects, far past
+    // any real bucket yet still finite.
+    constexpr int kMaxPages = 100000;
+    for (int pageNum = 0; pageNum < kMaxPages; ++pageNum) {
         Impl::Op op;
         op.method = "GET";
         op.bucket = bucket;
@@ -366,6 +427,7 @@ Result Client::listObjects(const std::string& bucket, const std::string& prefix,
                           0};
         token = page.nextToken;
     }
+    return Result{Error{ErrorKind::parse, 0, "", "listing exceeded maximum page count", 0}, 0};
 }
 
 } // namespace slims3
