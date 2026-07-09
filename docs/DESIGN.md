@@ -187,10 +187,17 @@ private:
 | `putObject`    | `PUT /{bucket}/{key}` with body                      | Payload SHA-256 is computed and signed. `Content-Type`, `Content-Encoding`, extra headers included in the signed request. |
 | `putFile`      | same                                                 | Reads the file fully into memory (v1 targets small/medium objects), then as `putObject`. |
 | `getObject`    | `GET /{bucket}/{key}`                                | Body streamed to `sink` chunk by chunk. Response headers (`Content-Type`, `Content-Encoding`, `Content-Length`, `ETag`) reported via `meta` before the first sink call. On HTTP error the body is captured internally for S3 error parsing instead of being fed to the sink. |
-| `getToFile`    | same                                                 | Streams to `filePath + ".part"`, renames over `filePath` on success, removes the temp file on failure/cancel. |
+| `getToFile`    | same                                                 | Streams to `filePath + ".part"` opened exclusively (`O_EXCL`/`O_NOFOLLOW` on POSIX — refuses to follow a symlink or reuse a pre-existing/stale temp file; see Implementation notes), renames over `filePath` on success, removes the temp file on failure/cancel. |
 | `statObject`   | `HEAD /{bucket}/{key}`                               | 404 → error `{s3, 404, "NoSuchKey"}` (HEAD has no body; code synthesized from status). |
 | `deleteObject` | `DELETE /{bucket}/{key}`                             | 204 → ok. Deleting a nonexistent key is success (S3 semantics). |
-| `listObjects`  | `GET /{bucket}?list-type=2&encoding-type=url&prefix=…[&delimiter=/][&continuation-token=…]` | Pagination handled internally (loops on `IsTruncated`/`NextContinuationToken`). `recursive=false` sets `delimiter=/` and emits `CommonPrefixes` entries with `isPrefix=true`. Keys are URL-decoded (`encoding-type=url`). |
+| `listObjects`  | `GET /{bucket}?list-type=2&encoding-type=url&prefix=…[&delimiter=/][&continuation-token=…]` | Pagination handled internally (loops on `IsTruncated`/`NextContinuationToken`, capped at 100000 pages — see Implementation notes). `recursive=false` sets `delimiter=/` and emits `CommonPrefixes` entries with `isPrefix=true`. Keys are URL-decoded (`encoding-type=url`). |
+
+Header names/values passed via `PutOptions` (`contentType`, `contentEncoding`,
+`extraHeaders`) are validated before signing: any byte `< 0x20` (CR, LF, NUL)
+is rejected, and header names additionally reject `:`. A caller forwarding
+untrusted values (e.g. proxied `x-amz-meta-*` metadata) cannot inject extra
+header lines or corrupt the signature this way; a rejected header returns
+`ErrorKind::transport` before any network I/O.
 
 `Result.bytesTransferred` is the object body size moved over the wire (uploads:
 bytes sent; downloads: bytes written to sink/file) — callers can verify it against
@@ -228,6 +235,11 @@ src/uri.{hpp,cpp}             S3 URI/query percent-encoding rules
 - Uploads use `CURLOPT_UPLOAD` + read callback over the in-memory payload;
   downloads use a write callback that routes to the sink or, on error status, to an
   internal buffer for S3 error parsing.
+- Response caps guard against a malicious or misbehaving server: a response
+  header count cap, a cumulative header-bytes cap, a status-line/interim-
+  response cap, and an in-memory body cap on the error/no-sink path. Any cap
+  tripping aborts the transfer as `ErrorKind::transport`, never a silent
+  truncation — values and rationale in Implementation notes.
 
 ### signer
 
@@ -255,25 +267,37 @@ Not a general XML parser — a targeted extractor for exactly two machine-genera
 shapes: `<Error><Code>…<Message>…` and `ListBucketResult` (`Contents` →
 `Key/Size/ETag`, `CommonPrefixes` → `Prefix`, `IsTruncated`,
 `NextContinuationToken`). Handles the five predefined XML entities and numeric
-character references. Listing is requested with `encoding-type=url`, so keys arrive
-percent-encoded ASCII and exotic-key edge cases reduce to URL decoding. Unit-tested
+character references; a reference outside the valid Unicode scalar range (`0`,
+`> 0x10FFFF`, or the UTF-16 surrogate block `0xD800`–`0xDFFF`) is rejected —
+left un-decoded rather than mis-encoded to invalid UTF-8. Listing is requested
+with `encoding-type=url`, so keys arrive percent-encoded ASCII and exotic-key
+edge cases reduce to URL decoding. Unit-tested
 on captured responses from MinIO, RustFS, and AWS documentation examples. If a
 server ever produces XML this extractor cannot handle, it fails loudly
 (`ErrorKind::parse`), and swapping in a full parser stays an internal change.
 
 ## 6. Error model
 
-Exactly one of the `ErrorKind` values describes every outcome. Mapping rules:
+Exactly one of the `ErrorKind` values describes every outcome. Success is
+strictly a 2xx status (`[200,300)`); everything else — including a 3xx
+redirect, which slim-s3 never follows (`CURLOPT_FOLLOWLOCATION` is off) — is
+an error. `mapError` applies these rules in order; the first match wins:
 
-1. curl returned an error → `transport` (`curlCode`, `message` from
-   `curl_easy_strerror` + effective URL). `httpStatus = 0`.
-2. HTTP status ≥ 400 with parseable S3 XML body → `s3` (`httpStatus`, `s3Code`,
-   `message` from the body).
-3. HTTP status ≥ 400 otherwise → `http` (`httpStatus`, body snippet in `message`);
-   for HEAD requests the code is synthesized (`404` → `"NoSuchKey"`/`"NoSuchBucket"`)
-   since HEAD responses carry no body.
-4. 2xx but the body failed to parse (listing) → `parse`.
-5. Aborted by `cancel()` or a callback → `cancelled`.
+1. **Aborted** — `cancel()` was called, or a `WriteFn`/`ProgressFn` returned
+   `false` → `cancelled`. Takes priority even when curl also reports a
+   transport-level failure for the same abort.
+2. **Transport** — curl reported a failure: DNS, connect, TLS, timeout, stall
+   guard, or one of the response caps in the Implementation notes below →
+   `transport` (`curlCode`, `message` from `curl_easy_strerror` + detail).
+   `httpStatus = 0`.
+3. **S3** — HTTP status ≥ 400 with a parseable S3 error XML body → `s3`
+   (`httpStatus`, `s3Code`, `message` from the body); for HEAD requests, which
+   carry no body, the code is synthesized on 404 (`"NoSuchKey"`/
+   `"NoSuchBucket"`).
+4. **HTTP** — any other non-2xx status: ≥ 400 without a parseable body, or a
+   stray 3xx/1xx → `http` (`httpStatus`, body snippet in `message`; a
+   redirect status is flagged `"(redirect not followed)"`).
+5. **Parse** — 2xx but the body failed to parse (listing) → `parse`.
 
 This carries everything a caller's retry policy needs (`transport` and 5xx →
 retryable; 4xx → usually fatal) without the library imposing one.
@@ -305,32 +329,117 @@ retryable; 4xx → usually fatal) without the library imposing one.
   under `tests/data/`).
 - SHA-256/HMAC against NIST + RFC 4231 vectors.
 - URI/query encoding: spaces, unicode, `=`, `+`, `~`, empty values, sort order.
-- `xml_lite` on captured MinIO/RustFS/AWS responses, entity decoding, truncated
-  and hostile inputs (must fail cleanly, never crash).
+- `xml_lite` on captured MinIO/RustFS/AWS responses, entity decoding
+  (including the surrogate-rejection case above), truncated and hostile
+  inputs (must fail cleanly, never crash).
+- Header-name/value validation (`validHeaderToken`): CR/LF/NUL rejection, `:`
+  rejection in names, accepted-vs-rejected boundary cases.
+- Client-level mapping and edge cases: endpoint parsing, null-data PUT, HEAD
+  404 code synthesis, delete-of-missing-key success.
 
-**Integration (docker, run in CI):** matrix over **MinIO** and **RustFS**:
+**Integration (docker, run in CI):** matrix over **MinIO** and **RustFS**, plus a
+raw-socket malicious/misbehaving-server stub (`tests/integration/stub_server.py`):
 - bucket create / exists / not-exists / wrong-credentials (403 surfaces, not
   swallowed);
 - put → stat → get → byte-for-byte round-trip → delete;
 - `Content-Encoding` pass-through: stored and returned;
 - listing: >1000 objects (pagination), prefix filtering, recursive vs
   delimiter mode, keys with spaces/unicode/`=`;
-- cancellation mid-download and mid-upload;
+- cancellation mid-download and mid-upload, from another thread and via a
+  callback returning `false`;
 - **silent-server test**: a stub accepts the TCP connection and never responds —
   the operation must fail in ≈`lowSpeedTimeSec`, not hang (the minio-cpp lesson,
-  now a permanent regression test).
+  now a permanent regression test);
+- **stub scenarios** exercising the response caps and edge cases a real
+  MinIO/RustFS never triggers: header-count flood, header-byte flood,
+  status-line flood, body-size overflow, delete of a missing key (404 →
+  success), malformed/truncated listing XML, an empty or repeated
+  continuation token, and a failing PUT (500);
+- filesystem-failure paths: `getToFile` against a short write / disk-full
+  condition (reported as `transport`, not `cancelled`).
 
-**CI (GitHub Actions):** gcc + clang builds, one ASan/UBSan job, unit tests on
-every push, integration matrix via docker services.
+**CI (GitHub Actions):** three jobs — `unit` (gcc, clang, and an ASan/UBSan
+build; unit tests plus the silent-server regression on every push),
+`integration` (the MinIO/RustFS/stub matrix above), and `coverage` (an
+instrumented `--coverage` build re-running the same unit, integration, and
+stub suites under `gcovr` with branch/decision coverage, currently ~98.5%
+line / ~88% decision on `src/`+`include/`, publishing an HTML report as a
+build artifact).
 
-## 10. Roadmap (post-v1)
+## 10. Implementation notes
+
+Decisions made during the build that refine or extend §2–§9 above.
+
+**Response caps (server-driven DoS defenses).** A malicious or merely
+misbehaving server must not be able to hang or exhaust memory in a client
+that otherwise has generous timeouts. Four caps, all enforced in
+`transport.cpp`, all mapping to `ErrorKind::transport` (abort, never a silent
+truncation):
+- response header count: 2000 lines;
+- cumulative response header bytes: 256 KiB — deliberately set below
+  libcurl's own `MAX_HTTP_RESP_HEADER_SIZE` (~300 KiB) so slim-s3's cap fires
+  first and owns the error message instead of a generic curl failure;
+- status-line/interim-response blocks: 32 — guards against a server streaming
+  spoofed or interim (1xx) status lines forever, which would otherwise reset
+  the header count/byte counters (those two are cumulative for the whole
+  exchange, not per status-line block) and slip past the low-speed stall
+  guard with a trickle just above its floor;
+- in-memory response body: 8 MiB, on the error/no-sink path only (S3 error
+  bodies and whole-body captures for listing — the streaming
+  `getObject`/`getToFile` sink path is not capped here; the caller's
+  sink/progress callback is the cancellation point for those).
+
+`listObjects` pagination is capped separately at 100000 pages (100M objects
+at 1000 keys/page): a per-request timeout doesn't bound a whole paginated
+operation, and this bounds it against a server handing out continuation
+tokens forever.
+
+**Caller-input hardening.** `putObject` validates `PutOptions.contentType`,
+`contentEncoding`, and every `extraHeaders` name/value with `validHeaderToken`
+before signing: any byte `< 0x20` (covers CR, LF, NUL) is rejected, and header
+names additionally reject `:`. This runs before the canonical request is
+built, so a caller forwarding untrusted values (e.g. proxied `x-amz-meta-*`
+metadata) cannot inject extra header lines or corrupt the signature this way.
+Rejection returns `ErrorKind::transport` with no network I/O performed.
+
+**`getToFile` atomicity.** The temp file is opened with
+`O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW` (mode 0600) on POSIX: `O_EXCL` refuses to
+reuse a pre-existing path — including a stale `.part` left by a crashed prior
+download, which now blocks the new download with a clear error instead of
+being silently truncated — and `O_NOFOLLOW` refuses to follow a pre-planted
+symlink. The file is renamed over the destination only when the transfer and
+the final `fflush` both succeed; it is removed on any failure, cancellation,
+or write error. Windows v1 falls back to a plain `fopen` (no O_EXCL/O_NOFOLLOW
+equivalent wired up yet) — CI and the hardening above currently target Linux.
+
+**Cancellation & progress.** `cancel()` sets an atomic flag read by the
+xferinfo callback, which libcurl invokes throughout the transfer including
+the connect phase; a `WriteFn`/`ProgressFn` returning `false` is funneled
+through the same abort path. Both map to `ErrorKind::cancelled`. `cancel()`
+is the only method safe to call from a thread other than the one running the
+current operation; each operation call resets the flag on entry, so a client
+can be reused for a following operation after a cancel.
+
+**Testing.** The raw-socket stub server (`tests/integration/stub_server.py`,
+driven by `tests/integration/run_stub.sh`) is what makes the caps above
+testable at all — no real S3-compatible server will misbehave this way. The
+CI `coverage` job re-runs the unit, MinIO/RustFS, silent-server, and stub
+suites under `--coverage` instrumentation and publishes an HTML report; see
+§9 for current numbers.
+
+**Dependencies.** Confirmed as designed: the library links exactly
+`CURL::libcurl` (`CMakeLists.txt`); doctest (vendored, tests only) and the
+python3 stub/silent-server scripts are test-only, not part of the installed
+package.
+
+## 11. Roadmap (post-v1)
 
 - Virtual-hosted addressing style (needed for AWS-first users).
 - Multipart upload for >5 GB objects / bounded-memory `putFile`.
 - Optional response body streaming for `putFile` without full read into memory.
 - Presigned URL generation (pure signer work, no transport).
 
-## 11. Downstream (out of repo scope)
+## 12. Downstream (out of repo scope)
 
 The first production consumer is a Qt service that wraps slim-s3 behind its
 existing `AbstractClient` interface (QString/QByteArray conversion + its own
