@@ -1,5 +1,6 @@
 #include "sha256.hpp"
 
+#include <algorithm>
 #include <cstring>
 
 namespace slims3::detail {
