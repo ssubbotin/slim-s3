@@ -146,10 +146,14 @@ TEST_CASE("full server matrix") {
     }));
     CHECK(firstOnly == 1);
 
-    // -- cancellation mid-download
-    std::size_t chunks = 0;
+    // -- cancellation mid-download (sink refuses the very first chunk)
+    bool sawData = false;
     Result rCancel = cl.getObject(b, "dir/k ey+with=chars.bin",
-                                  [&](const char*, std::size_t) { return ++chunks < 2; });
+                                  [&](const char*, std::size_t) {
+                                      sawData = true;
+                                      return false;
+                                  });
+    CHECK(sawData);
     CHECK_FALSE(rCancel);
     CHECK(rCancel.error.kind == ErrorKind::cancelled);
 

@@ -7,7 +7,7 @@ BIN="$(dirname "$0")/../../build/tests/slims3_itest"
 if [ "${1:-}" = "--silent" ]; then
     python3 "$(dirname "$0")/silent_server.py" 19999 &
     SRV=$!
-    trap 'kill $SRV' EXIT
+    trap 'kill $SRV 2>/dev/null || true' EXIT
     sleep 1
     SLIMS3_SILENT_ENDPOINT="http://127.0.0.1:19999" "$BIN" --no-intro
 else
