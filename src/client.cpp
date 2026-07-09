@@ -282,8 +282,40 @@ Result Client::getToFile(const std::string& bucket, const std::string& key,
         return Result{Error{ErrorKind::transport, 0, "", "write failed: " + part, 0}, 0};
     return r;
 }
-Result Client::listObjects(const std::string&, const std::string&, bool, const ListFn&) {
-    return Result{Error{ErrorKind::transport, 0, "", "not implemented", 0}, 0};
+Result Client::listObjects(const std::string& bucket, const std::string& prefix, bool recursive,
+                           const ListFn& onObject) {
+    impl_->cancel.store(false);
+    std::string token;
+    while (true) {
+        Impl::Op op;
+        op.method = "GET";
+        op.bucket = bucket;
+        op.query = {{"list-type", "2"}, {"encoding-type", "url"}};
+        if (!prefix.empty()) op.query.emplace_back("prefix", prefix);
+        if (!recursive) op.query.emplace_back("delimiter", "/");
+        if (!token.empty()) op.query.emplace_back("continuation-token", token);
+        HttpResponse resp;
+        Result r = impl_->run(op, resp);  // sink == null -> body accumulated in resp.body
+        if (!r) return r;
+
+        detail::ListPage page;
+        if (!detail::parseListPage(resp.body, page))
+            return Result{Error{ErrorKind::parse, int(resp.status), "",
+                                "cannot parse ListObjectsV2 response", 0}, 0};
+        for (const auto& e : page.entries) {
+            ObjectInfo info;
+            info.key = detail::urlDecode(e.key);  // encoding-type=url
+            info.size = e.size;
+            info.etag = e.etag;
+            info.isPrefix = e.isPrefix;
+            if (!onObject(info)) return Result{};  // caller stop is not an error
+        }
+        if (!page.truncated) return Result{};
+        if (page.nextToken.empty() || page.nextToken == token)
+            return Result{Error{ErrorKind::parse, 0, "",
+                                "truncated listing without a fresh continuation token", 0}, 0};
+        token = page.nextToken;
+    }
 }
 
 } // namespace slims3
