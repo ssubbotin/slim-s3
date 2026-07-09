@@ -1,0 +1,62 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        toolchain: [gcc, clang, asan]
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+      - name: Configure
+        run: |
+          case "${{ matrix.toolchain }}" in
+            gcc)   cmake -B build -DSLIMS3_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release ;;
+            clang) cmake -B build -DSLIMS3_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release \
+                     -DCMAKE_CXX_COMPILER=clang++ ;;
+            asan)  cmake -B build -DSLIMS3_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Debug \
+                     -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+                     -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" ;;
+          esac
+      - run: cmake --build build -j
+      - run: ctest --test-dir build -LE integration --output-on-failure
+      - name: Silent-server regression
+        run: tests/integration/run.sh --silent
+
+  integration:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+      - run: cmake -B build -DSLIMS3_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 19000:9000 \
+            -e MINIO_ROOT_USER=testkey -e MINIO_ROOT_PASSWORD=testsecret123 \
+            minio/minio:latest server /data
+      - name: Start RustFS
+        run: |
+          docker run -d --name rustfs -p 19010:9000 \
+            -e RUSTFS_ADDRESS=0.0.0.0:9000 \
+            -e RUSTFS_ACCESS_KEY=testkey -e RUSTFS_SECRET_KEY=testsecret123 \
+            rustfs/rustfs:latest
+      - name: Wait for servers
+        run: |
+          for p in 19000 19010; do
+            for i in $(seq 1 30); do
+              curl -sf "http://127.0.0.1:$p" -o /dev/null && break || true
+              # any HTTP response (incl. 403) means the port is serving
+              code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$p" || echo 000)
+              [ "$code" != "000" ] && break
+              sleep 2
+            done
+          done
+      - name: Run against MinIO
+        run: tests/integration/run.sh http://127.0.0.1:19000 testkey testsecret123
+      - name: Run against RustFS
+        run: tests/integration/run.sh http://127.0.0.1:19010 testkey testsecret123

@@ -2,8 +2,44 @@
 
 A slim S3 client for C++17. One dependency: libcurl. No SDK heft.
 
-**Status: design phase.** See [docs/DESIGN.md](docs/DESIGN.md) for the full design:
-motivation, API, signing approach, and testing strategy. Implementation follows.
+See [docs/DESIGN.md](docs/DESIGN.md) for the full design: motivation, API, signing
+approach, and testing strategy.
+
+## Build
+
+```bash
+cmake -B build && cmake --build build -j
+# or as a subproject: add_subdirectory(slim-s3) + target_link_libraries(app slims3::slims3)
+```
+
+## Usage
+
+```cpp
+#include <slims3/slims3.hpp>
+
+slims3::Config cfg;
+cfg.endpoint = "http://127.0.0.1:9000";
+cfg.accessKey = "minioadmin";
+cfg.secretKey = "minioadmin";
+slims3::Client s3(cfg);
+
+slims3::PutOptions po;
+po.contentType = "application/octet-stream";
+std::string data = "hello";
+if (auto r = s3.putObject("bucket", "path/key.bin", data.data(), data.size(), po); !r)
+    fprintf(stderr, "%s\n", r.error.message.c_str());
+
+s3.getToFile("bucket", "path/key.bin", "/tmp/key.bin");
+```
+
+Errors carry `httpStatus` and `s3Code` — retry policy stays in your hands:
+
+```cpp
+bool retryable(const slims3::Error& e) {
+    return e.kind == slims3::ErrorKind::transport ||
+           (e.kind != slims3::ErrorKind::cancelled && e.httpStatus >= 500);
+}
+```
 
 ## Why
 
