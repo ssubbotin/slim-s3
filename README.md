@@ -20,7 +20,7 @@ A vcpkg port lives in this repo under `packaging/vcpkg/ports/slims3` and is not 
 merged upstream into microsoft/vcpkg. Use it as an overlay port until it is:
 
 ```bash
-/opt/vcpkg/vcpkg install slims3 --overlay-ports=<path-to-slim-s3>/packaging/vcpkg/ports
+vcpkg install slims3 --overlay-ports=<path-to-slim-s3>/packaging/vcpkg/ports
 ```
 
 Then, in a consumer's `CMakeLists.txt`:
@@ -40,6 +40,47 @@ cmake -B build \
 
 Upstream submission to microsoft/vcpkg is planned; once merged, the overlay flag
 won't be needed and a plain `vcpkg install slims3` will work.
+
+### Conan
+
+A `conanfile.py` lives at the repo root (`name = "slims3"`, `version = "0.1.0"`).
+It is not yet published to ConanCenter, so consume it from a local checkout or a
+local Conan cache for now:
+
+```bash
+git clone https://github.com/ssubbotin/slim-s3.git
+cd slim-s3
+conan create .
+```
+
+Then, in a consumer's `conanfile.txt`:
+
+```ini
+[requires]
+slims3/0.1.0
+
+[generators]
+CMakeToolchain
+CMakeDeps
+```
+
+or `conanfile.py`:
+
+```python
+def requirements(self):
+    self.requires("slims3/0.1.0")
+```
+
+and in the consumer's `CMakeLists.txt`, the same target as the other install paths:
+
+```cmake
+find_package(slims3 CONFIG REQUIRED)
+target_link_libraries(app PRIVATE slims3::slims3)
+```
+
+Submission to ConanCenter (conan-center-index) is planned; once accepted, a plain
+`conan install --requires=slims3/0.1.0` from the default remote will work without
+a local `conan create`.
 
 ## Usage
 

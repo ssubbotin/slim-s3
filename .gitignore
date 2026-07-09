@@ -4,3 +4,8 @@ compile_commands.json
 .superpowers/
 __pycache__/
 docs/plans/
+
+# Conan
+test_package/build/
+test_package/CMakeUserPresets.json
+CMakeUserPresets.json
