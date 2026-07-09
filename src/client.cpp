@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <ctime>
 #include <fstream>
+#include <iterator>
 
 #include "client_detail.hpp"
 #include "sha256.hpp"
@@ -209,22 +210,77 @@ Result Client::deleteObject(const std::string& bucket, const std::string& key) {
     return r;
 }
 
-// putObject/putFile/getObject/getToFile/listObjects arrive in Tasks 8-9.
-Result Client::putObject(const std::string&, const std::string&, const void*, std::size_t,
-                         const PutOptions&, const ProgressFn&) {
-    return Result{Error{ErrorKind::transport, 0, "", "not implemented", 0}, 0};
+Result Client::putObject(const std::string& bucket, const std::string& key, const void* data,
+                         std::size_t len, const PutOptions& opts, const ProgressFn& progress) {
+    impl_->cancel.store(false);
+    Impl::Op op;
+    op.method = "PUT";
+    op.bucket = bucket;
+    op.key = key;
+    op.body = static_cast<const char*>(data);
+    op.bodyLen = len;
+    op.progress = progress;
+    if (!opts.contentType.empty()) op.extraHdrs.emplace_back("Content-Type", opts.contentType);
+    if (!opts.contentEncoding.empty())
+        op.extraHdrs.emplace_back("Content-Encoding", opts.contentEncoding);
+    for (const auto& kv : opts.extraHeaders) op.extraHdrs.push_back(kv);
+    HttpResponse resp;
+    return impl_->run(op, resp);
 }
-Result Client::putFile(const std::string&, const std::string&, const std::string&,
-                       const PutOptions&, const ProgressFn&) {
-    return Result{Error{ErrorKind::transport, 0, "", "not implemented", 0}, 0};
+
+Result Client::putFile(const std::string& bucket, const std::string& key,
+                       const std::string& filePath, const PutOptions& opts,
+                       const ProgressFn& progress) {
+    // v1 reads the whole file into memory (targets small/medium objects, and the
+    // payload hash must cover the full body anyway). Local I/O failures are
+    // reported as transport errors with curlCode == 0.
+    std::ifstream f(filePath, std::ios::binary);
+    if (!f) return Result{Error{ErrorKind::transport, 0, "", "cannot open file: " + filePath, 0}, 0};
+    std::string data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (f.bad()) return Result{Error{ErrorKind::transport, 0, "", "read failed: " + filePath, 0}, 0};
+    return putObject(bucket, key, data.data(), data.size(), opts, progress);
 }
-Result Client::getObject(const std::string&, const std::string&, const WriteFn&, const ProgressFn&,
-                         ObjectMeta*) {
-    return Result{Error{ErrorKind::transport, 0, "", "not implemented", 0}, 0};
+
+Result Client::getObject(const std::string& bucket, const std::string& key, const WriteFn& sink,
+                         const ProgressFn& progress, ObjectMeta* meta) {
+    impl_->cancel.store(false);
+    Impl::Op op;
+    op.method = "GET";
+    op.bucket = bucket;
+    op.key = key;
+    op.sink = sink;
+    op.progress = progress;
+    op.meta = meta;
+    HttpResponse resp;
+    Result r = impl_->run(op, resp);
+    if (r && meta) meta->info.key = key;
+    return r;
 }
-Result Client::getToFile(const std::string&, const std::string&, const std::string&,
-                         const ProgressFn&, ObjectMeta*) {
-    return Result{Error{ErrorKind::transport, 0, "", "not implemented", 0}, 0};
+
+Result Client::getToFile(const std::string& bucket, const std::string& key,
+                         const std::string& filePath, const ProgressFn& progress,
+                         ObjectMeta* meta) {
+    const std::string part = filePath + ".part";
+    std::FILE* f = std::fopen(part.c_str(), "wb");
+    if (!f) return Result{Error{ErrorKind::transport, 0, "", "cannot open file: " + part, 0}, 0};
+    WriteFn sink = [f](const char* data, std::size_t len) {
+        return std::fwrite(data, 1, len, f) == len;
+    };
+    Result r = getObject(bucket, key, sink, progress, meta);
+    bool flushOk = (std::fflush(f) == 0);
+    std::fclose(f);
+    if (r && flushOk) {
+        if (std::rename(part.c_str(), filePath.c_str()) != 0) {
+            std::remove(part.c_str());
+            return Result{Error{ErrorKind::transport, 0, "", "rename failed: " + filePath, 0},
+                          r.bytesTransferred};
+        }
+        return r;
+    }
+    std::remove(part.c_str());
+    if (r && !flushOk)
+        return Result{Error{ErrorKind::transport, 0, "", "write failed: " + part, 0}, 0};
+    return r;
 }
 Result Client::listObjects(const std::string&, const std::string&, bool, const ListFn&) {
     return Result{Error{ErrorKind::transport, 0, "", "not implemented", 0}, 0};
