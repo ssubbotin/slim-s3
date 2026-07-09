@@ -11,7 +11,7 @@ jobs:
       matrix:
         toolchain: [gcc, clang, asan]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
       - name: Configure
         run: |
@@ -31,7 +31,7 @@ jobs:
   integration:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
       - run: cmake -B build -DSLIMS3_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
       - name: Start MinIO
