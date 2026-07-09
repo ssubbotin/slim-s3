@@ -6,7 +6,7 @@ import os
 
 class Slims3Conan(ConanFile):
     name = "slims3"
-    version = "0.1.0"
+    version = "0.1.1"
     license = "MIT"
     author = "Sergey Subbotin"
     url = "https://github.com/ssubbotin/slim-s3"

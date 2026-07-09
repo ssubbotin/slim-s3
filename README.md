@@ -43,7 +43,7 @@ won't be needed and a plain `vcpkg install slims3` will work.
 
 ### Conan
 
-A `conanfile.py` lives at the repo root (`name = "slims3"`, `version = "0.1.0"`).
+A `conanfile.py` lives at the repo root (`name = "slims3"`, `version = "0.1.1"`).
 It is not yet published to ConanCenter, so consume it from a local checkout or a
 local Conan cache for now:
 
@@ -57,7 +57,7 @@ Then, in a consumer's `conanfile.txt`:
 
 ```ini
 [requires]
-slims3/0.1.0
+slims3/0.1.1
 
 [generators]
 CMakeToolchain
@@ -68,7 +68,7 @@ or `conanfile.py`:
 
 ```python
 def requirements(self):
-    self.requires("slims3/0.1.0")
+    self.requires("slims3/0.1.1")
 ```
 
 and in the consumer's `CMakeLists.txt`, the same target as the other install paths:
@@ -79,7 +79,7 @@ target_link_libraries(app PRIVATE slims3::slims3)
 ```
 
 Submission to ConanCenter (conan-center-index) is planned; once accepted, a plain
-`conan install --requires=slims3/0.1.0` from the default remote will work without
+`conan install --requires=slims3/0.1.1` from the default remote will work without
 a local `conan create`.
 
 ## Usage

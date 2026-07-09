@@ -1,6 +1,6 @@
 {
   "name": "slims3",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A slim S3 client for C++17. One dependency: libcurl. No SDK heft.",
   "homepage": "https://github.com/ssubbotin/slim-s3",
   "license": "MIT",
