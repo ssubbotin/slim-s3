@@ -259,19 +259,33 @@ TEST_CASE("Client::cancel() from another thread aborts an in-flight download") {
     Client cl(baseConfig());
     const std::string b = bucketName() + "-cancel";
     ensureBucket(cl, b);
-    // Large enough that the transfer is still running when cancel() fires on
-    // localhost; enlarge this (not the pre-cancel sleep below) if this ever
-    // flakes.
-    std::string payload(64 * 1024 * 1024, '\x11'); // 64 MiB
+    // A few MB is plenty: the canceller below is gated on a first-byte
+    // handshake rather than a fixed sleep racing against transfer speed, so
+    // the object just needs to still be transferring after the first chunk.
+    std::string payload(8 * 1024 * 1024, '\x11'); // 8 MiB
     REQUIRE(cl.putObject(b, "huge", payload.data(), payload.size()));
 
     std::atomic<bool> cancelCalled{false};
+    std::atomic<bool> firstByteSeen{false};
     std::thread canceller([&] {
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        // Spin-wait for the sink to have been invoked at least once. This
+        // guarantees getObject already reset the cancel flag and started the
+        // transfer (no before-reset race) and that the transfer is still
+        // mid-flight (no completion race), regardless of hardware speed.
+        int spins = 0;
+        while (!firstByteSeen.load()) {
+            if (++spins > 100000)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            else
+                std::this_thread::yield();
+        }
         cl.cancel();
         cancelCalled = true;
     });
-    Result r = cl.getObject(b, "huge", [](const char*, std::size_t) { return true; });
+    Result r = cl.getObject(b, "huge", [&](const char*, std::size_t) {
+        firstByteSeen = true;
+        return true;
+    });
     canceller.join();
     CHECK(cancelCalled);
     CHECK_FALSE(r);
@@ -508,25 +522,22 @@ TEST_CASE("stub: header count flood aborts with transport, not cancelled") {
     CHECK(r.error.message.find("headers exceeded") != std::string::npos);
 }
 
-TEST_CASE("stub: oversized header block aborts with transport, not cancelled") {
-    // NOTE: this does NOT exercise slim-s3's own kMaxHeaderBytes (1 MiB) cap in
-    // transport.cpp -- empirically, libcurl itself enforces a stricter, hard-coded
-    // total-response-header-size limit (observed as exactly 300*1024 bytes,
-    // cumulative across status-line blocks, matching libcurl's internal
-    // CURL_MAX_HTTP_HEADER) and aborts curl_easy_perform() on its own before our
-    // header byte counter can ever reach 1 MiB. That half of the kMaxHeaderCount/
-    // kMaxHeaderBytes OR at transport.cpp's onHeader is therefore unreachable via
-    // any real HTTP exchange with any libcurl build carrying that guard (verified
-    // both via curl(1) directly and through this library). What IS asserted here,
-    // and is real coverage: the error-mapping invariant still holds for this
-    // server-driven abort -- ErrorKind::transport, never cancelled.
+TEST_CASE("stub: oversized header block (byte cap) aborts with transport, not cancelled") {
+    // kMaxHeaderBytes (256 KiB) is now below libcurl's own cumulative
+    // MAX_HTTP_RESP_HEADER_SIZE (300 KiB), so slim-s3's byte cap fires first
+    // and owns the error, unlike before. The stub sends fewer than
+    // kMaxHeaderCount (2000) headers whose cumulative bytes still exceed
+    // kMaxHeaderBytes, so this exercises the BYTE-cap branch specifically
+    // (header_count_flood above exercises the count-cap branch). The two
+    // caps share transport.cpp's "response headers exceeded limit" message,
+    // so that message is what's asserted here.
     if (!stubIs("header_byte_flood"))
         return;
     Client cl(stubConfig());
     Result r = cl.listObjects("b", "", true, [](const ObjectInfo&) { return true; });
     CHECK_FALSE(r);
     CHECK(r.error.kind == ErrorKind::transport);
-    CHECK_FALSE(r.error.message.empty());
+    CHECK(r.error.message.find("headers exceeded") != std::string::npos);
 }
 
 TEST_CASE("stub: status line flood aborts with transport, not cancelled") {
@@ -614,4 +625,31 @@ TEST_CASE("stub: TLS option lines + operationTimeoutSec execute cleanly over htt
     Client cl(c);
     Result r = cl.listObjects("b", "", true, [](const ObjectInfo&) { return true; });
     CHECK(bool(r));
+}
+
+// Extra belt (run_stub.sh's own name-validation guard is sufficient on its
+// own): if SLIMS3_STUB_SCENARIO is set to a name none of the stubIs() checks
+// above recognize, fail loudly here instead of every TEST_CASE above quietly
+// returning and the run reporting SUCCESS with zero assertions.
+TEST_CASE("stub: SLIMS3_STUB_SCENARIO, if set, matches a known stubIs() case") {
+    std::string scen = env("SLIMS3_STUB_SCENARIO");
+    if (env("SLIMS3_STUB_ENDPOINT").empty() || scen.empty())
+        return;
+    static const char* kKnownScenarios[] = {"header_count_flood",
+                                            "header_byte_flood",
+                                            "status_line_flood",
+                                            "body_overflow",
+                                            "delete_404",
+                                            "list_bad_xml",
+                                            "list_empty_token",
+                                            "list_page_fail",
+                                            "put_500",
+                                            "ok"};
+    bool known = false;
+    for (const char* s : kKnownScenarios)
+        if (scen == s) {
+            known = true;
+            break;
+        }
+    CHECK(known);
 }

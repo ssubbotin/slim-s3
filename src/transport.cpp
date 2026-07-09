@@ -45,7 +45,10 @@ struct CbCtx {
 // headers: a per-line count cap and a cumulative-bytes cap. Both are well
 // past anything a real S3-compatible server sends.
 constexpr std::size_t kMaxHeaderCount = 2000;
-constexpr std::size_t kMaxHeaderBytes = 1 * 1024 * 1024;
+// 256 KiB: below libcurl's cumulative MAX_HTTP_RESP_HEADER_SIZE (300 KiB) so
+// slim-s3's cap fires first and owns the error message; still astronomically
+// above any legitimate S3 response header set (a few KB).
+constexpr std::size_t kMaxHeaderBytes = 256 * 1024;
 // Cap on the number of status-line blocks ("HTTP/..." lines) in a single
 // exchange. A legitimate response has exactly one; we don't follow redirects
 // (FOLLOWLOCATION is off) and suppress Expect, so a stray 1xx like 103 Early

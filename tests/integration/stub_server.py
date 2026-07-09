@@ -69,10 +69,13 @@ def header_count_flood(conn):
 
 
 def header_byte_flood(conn):
-    # kMaxHeaderBytes is 1 MiB; 1200 headers * ~1010 bytes each ~= 1.2 MiB,
-    # comfortably over the byte cap while staying under the 2000-line cap.
-    value = "A" * 1000
-    hdrs = "".join("X-Pad-%d: %s\r\n" % (i, value) for i in range(1200))
+    # kMaxHeaderBytes is 256 KiB; 400 headers * ~700-byte values ~= 280 KiB
+    # cumulative, comfortably over the byte cap while staying well under the
+    # 2000-line count cap (400 < 2000) -- the byte cap trips first, around
+    # header ~370, so this exercises the BYTE-cap branch specifically, not
+    # the count cap (which header_count_flood covers separately).
+    value = "A" * 700
+    hdrs = "".join("X-Pad-%d: %s\r\n" % (i, value) for i in range(400))
     resp = "HTTP/1.1 200 OK\r\n%sContent-Length: 0\r\nConnection: close\r\n\r\n" % hdrs
     send(conn, resp.encode("latin-1"))
 
