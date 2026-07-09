@@ -12,6 +12,35 @@ cmake -B build && cmake --build build -j
 # or as a subproject: add_subdirectory(slim-s3) + target_link_libraries(app slims3::slims3)
 ```
 
+## Installation
+
+### vcpkg (overlay port)
+
+A vcpkg port lives in this repo under `packaging/vcpkg/ports/slims3` and is not yet
+merged upstream into microsoft/vcpkg. Use it as an overlay port until it is:
+
+```bash
+/opt/vcpkg/vcpkg install slims3 --overlay-ports=<path-to-slim-s3>/packaging/vcpkg/ports
+```
+
+Then, in a consumer's `CMakeLists.txt`:
+
+```cmake
+find_package(slims3 CONFIG REQUIRED)
+target_link_libraries(app PRIVATE slims3::slims3)
+```
+
+configuring with the vcpkg toolchain file:
+
+```bash
+cmake -B build \
+  -DCMAKE_TOOLCHAIN_FILE=<path-to-vcpkg>/scripts/buildsystems/vcpkg.cmake \
+  -DVCPKG_OVERLAY_PORTS=<path-to-slim-s3>/packaging/vcpkg/ports
+```
+
+Upstream submission to microsoft/vcpkg is planned; once merged, the overlay flag
+won't be needed and a plain `vcpkg install slims3` will work.
+
 ## Usage
 
 ```cpp
