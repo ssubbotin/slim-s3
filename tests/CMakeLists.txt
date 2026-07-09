@@ -5,6 +5,7 @@ add_executable(slims3_tests
     test_uri.cpp
     test_signer.cpp
     test_xml.cpp
+    test_transport.cpp
 )
 target_link_libraries(slims3_tests PRIVATE slims3)
 target_include_directories(slims3_tests PRIVATE
