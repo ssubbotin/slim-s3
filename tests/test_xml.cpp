@@ -26,9 +26,9 @@ TEST_CASE("parseListPage: entries, prefixes, truncation") {
     ListPage p;
     REQUIRE(parseListPage(kListSample, p));
     REQUIRE(p.entries.size() == 3);
-    CHECK(p.entries[0].key == "data/file%20one.rss");   // still URL-encoded at this layer
+    CHECK(p.entries[0].key == "data/file%20one.rss"); // still URL-encoded at this layer
     CHECK(p.entries[0].size == 9672);
-    CHECK(p.entries[0].etag == "9bb58f26192e4ba00f01e2e7b136bbd8");  // quotes stripped
+    CHECK(p.entries[0].etag == "9bb58f26192e4ba00f01e2e7b136bbd8"); // quotes stripped
     CHECK_FALSE(p.entries[0].isPrefix);
     CHECK(p.entries[1].etag == "abc");
     CHECK(p.entries[2].isPrefix);
@@ -39,7 +39,8 @@ TEST_CASE("parseListPage: entries, prefixes, truncation") {
 
 TEST_CASE("parseListPage: empty result, not truncated") {
     ListPage p;
-    REQUIRE(parseListPage("<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>", p));
+    REQUIRE(
+        parseListPage("<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>", p));
     CHECK(p.entries.empty());
     CHECK_FALSE(p.truncated);
     CHECK(p.nextToken.empty());
@@ -47,9 +48,10 @@ TEST_CASE("parseListPage: empty result, not truncated") {
 
 TEST_CASE("parseErrorBody") {
     S3ErrorBody e;
-    REQUIRE(parseErrorBody(
-        "<?xml version=\"1.0\"?><Error><Code>NoSuchKey</Code>"
-        "<Message>The specified key does not exist.</Message><Key>x</Key></Error>", e));
+    REQUIRE(
+        parseErrorBody("<?xml version=\"1.0\"?><Error><Code>NoSuchKey</Code>"
+                       "<Message>The specified key does not exist.</Message><Key>x</Key></Error>",
+                       e));
     CHECK(e.code == "NoSuchKey");
     CHECK(e.message == "The specified key does not exist.");
     CHECK_FALSE(parseErrorBody("<NotAnError/>", e));
@@ -60,12 +62,14 @@ TEST_CASE("xmlUnescape: predefined entities and numeric refs") {
     CHECK(xmlUnescape("a&lt;b&gt;c&amp;d&quot;e&apos;f") == "a<b>c&d\"e'f");
     CHECK(xmlUnescape("&#65;&#x42;") == "AB");
     CHECK(xmlUnescape("no entities") == "no entities");
-    CHECK(xmlUnescape("&bogus;") == "&bogus;");  // unknown entity left as-is
+    CHECK(xmlUnescape("&bogus;") == "&bogus;"); // unknown entity left as-is
 }
 
 TEST_CASE("hostile input fails cleanly") {
     ListPage p;
-    CHECK_FALSE(parseListPage("<ListBucketResult><Contents><Key>a", p));  // unclosed tag
+    CHECK_FALSE(parseListPage("<ListBucketResult><Contents><Key>a", p)); // unclosed tag
+    ListPage p2;
+    CHECK_FALSE(parseListPage("<ListBucketResult><CommonPrefixes><Prefix>a", p2)); // unclosed tag
     S3ErrorBody e;
     CHECK_FALSE(parseErrorBody("", e));
 }

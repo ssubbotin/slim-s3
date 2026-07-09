@@ -58,3 +58,19 @@ TEST_CASE("mapError: HTTP error without S3 body") {
     CHECK(e.kind == ErrorKind::http);
     CHECK(e.httpStatus == 503);
 }
+
+TEST_CASE("mapError: 3xx redirect is an error, not success") {
+    HttpResponse r;
+    r.status = 301;
+    auto e = mapError(0, false, "", r, "");
+    CHECK(e.kind == ErrorKind::http);
+    CHECK(e.httpStatus == 301);
+    CHECK(e.message.find("redirect") != std::string::npos);
+}
+
+TEST_CASE("mapError: 204 (delete) stays inside the [200,300) success boundary") {
+    HttpResponse r;
+    r.status = 204;
+    auto e = mapError(0, false, "", r, "");
+    CHECK(e.kind == ErrorKind::none);
+}

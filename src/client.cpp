@@ -52,6 +52,17 @@ Error mapError(int curlCode, bool aborted, const std::string& curlError, const H
         }
         return e;
     }
+    if (resp.status < 200 || resp.status >= 300) {
+        // Success boundary is strictly [200,300): a 3xx (FOLLOWLOCATION is off,
+        // so we never actually follow one) or a stray 1xx must not be treated
+        // as success, or a redirect body could be written to the sink / used
+        // to fill meta from redirect headers.
+        e.kind = ErrorKind::http;
+        e.httpStatus = int(resp.status);
+        e.message = "HTTP " + std::to_string(resp.status) +
+                    ((resp.status >= 300 && resp.status < 400) ? " (redirect not followed)" : "");
+        return e;
+    }
     return e; // none
 }
 
@@ -101,6 +112,9 @@ struct Client::Impl {
         sp.canonicalUri = canonicalUri;
         sp.canonicalQuery = cq;
         sp.headers = op.extraHdrs;
+        // Invariant: the signed "host" value must equal what curl derives from
+        // the URL below; Endpoint::hostHeader() and Endpoint::baseUrl() are both
+        // built from the same host/port, and no explicit Host header is sent.
         sp.headers.emplace_back("host", ep.hostHeader());
         sp.payloadHashHex = payloadHash;
         sp.amzDate = amzDate;
@@ -213,17 +227,30 @@ Result Client::deleteObject(const std::string& bucket, const std::string& key) {
 Result Client::putObject(const std::string& bucket, const std::string& key, const void* data,
                          std::size_t len, const PutOptions& opts, const ProgressFn& progress) {
     impl_->cancel.store(false);
+    if (data == nullptr && len > 0)
+        return Result{Error{ErrorKind::transport, 0, "", "null data with non-zero length", 0}, 0};
     Impl::Op op;
     op.method = "PUT";
     op.bucket = bucket;
     op.key = key;
-    op.body = static_cast<const char*>(data);
-    op.bodyLen = len;
+    if (data == nullptr) {
+        // Empty body: use the same non-null sentinel trick as createBucket so
+        // this never turns into a bodyless PUT (which transport.cpp's PUT
+        // invariant check would reject, and which curl would send as a GET).
+        static const char kEmpty = 0;
+        op.body = &kEmpty;
+        op.bodyLen = 0;
+    } else {
+        op.body = static_cast<const char*>(data);
+        op.bodyLen = len;
+    }
     op.progress = progress;
-    if (!opts.contentType.empty()) op.extraHdrs.emplace_back("Content-Type", opts.contentType);
+    if (!opts.contentType.empty())
+        op.extraHdrs.emplace_back("Content-Type", opts.contentType);
     if (!opts.contentEncoding.empty())
         op.extraHdrs.emplace_back("Content-Encoding", opts.contentEncoding);
-    for (const auto& kv : opts.extraHeaders) op.extraHdrs.push_back(kv);
+    for (const auto& kv : opts.extraHeaders)
+        op.extraHdrs.push_back(kv);
     HttpResponse resp;
     return impl_->run(op, resp);
 }
@@ -235,9 +262,11 @@ Result Client::putFile(const std::string& bucket, const std::string& key,
     // payload hash must cover the full body anyway). Local I/O failures are
     // reported as transport errors with curlCode == 0.
     std::ifstream f(filePath, std::ios::binary);
-    if (!f) return Result{Error{ErrorKind::transport, 0, "", "cannot open file: " + filePath, 0}, 0};
+    if (!f)
+        return Result{Error{ErrorKind::transport, 0, "", "cannot open file: " + filePath, 0}, 0};
     std::string data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    if (f.bad()) return Result{Error{ErrorKind::transport, 0, "", "read failed: " + filePath, 0}, 0};
+    if (f.bad())
+        return Result{Error{ErrorKind::transport, 0, "", "read failed: " + filePath, 0}, 0};
     return putObject(bucket, key, data.data(), data.size(), opts, progress);
 }
 
@@ -253,7 +282,8 @@ Result Client::getObject(const std::string& bucket, const std::string& key, cons
     op.meta = meta;
     HttpResponse resp;
     Result r = impl_->run(op, resp);
-    if (r && meta) meta->info.key = key;
+    if (r && meta)
+        meta->info.key = key;
     return r;
 }
 
@@ -262,9 +292,15 @@ Result Client::getToFile(const std::string& bucket, const std::string& key,
                          ObjectMeta* meta) {
     const std::string part = filePath + ".part";
     std::FILE* f = std::fopen(part.c_str(), "wb");
-    if (!f) return Result{Error{ErrorKind::transport, 0, "", "cannot open file: " + part, 0}, 0};
-    WriteFn sink = [f](const char* data, std::size_t len) {
-        return std::fwrite(data, 1, len, f) == len;
+    if (!f)
+        return Result{Error{ErrorKind::transport, 0, "", "cannot open file: " + part, 0}, 0};
+    bool writeFailed = false;
+    WriteFn sink = [f, &writeFailed](const char* data, std::size_t len) {
+        if (std::fwrite(data, 1, len, f) != len) {
+            writeFailed = true;
+            return false;
+        }
+        return true;
     };
     Result r = getObject(bucket, key, sink, progress, meta);
     bool flushOk = (std::fflush(f) == 0);
@@ -278,6 +314,12 @@ Result Client::getToFile(const std::string& bucket, const std::string& key,
         return r;
     }
     std::remove(part.c_str());
+    // A disk write failure makes the sink return false, which transport.cpp
+    // reports as an aborted transfer; surface it as a transport error, not
+    // the generic "operation cancelled" (that must mean user/cancel/sink-
+    // refusal aborts unrelated to local I/O).
+    if (writeFailed)
+        return Result{Error{ErrorKind::transport, 0, "", "write failed: " + part, 0}, 0};
     if (r && !flushOk)
         return Result{Error{ErrorKind::transport, 0, "", "write failed: " + part, 0}, 0};
     return r;
@@ -291,29 +333,37 @@ Result Client::listObjects(const std::string& bucket, const std::string& prefix,
         op.method = "GET";
         op.bucket = bucket;
         op.query = {{"list-type", "2"}, {"encoding-type", "url"}};
-        if (!prefix.empty()) op.query.emplace_back("prefix", prefix);
-        if (!recursive) op.query.emplace_back("delimiter", "/");
-        if (!token.empty()) op.query.emplace_back("continuation-token", token);
+        if (!prefix.empty())
+            op.query.emplace_back("prefix", prefix);
+        if (!recursive)
+            op.query.emplace_back("delimiter", "/");
+        if (!token.empty())
+            op.query.emplace_back("continuation-token", token);
         HttpResponse resp;
-        Result r = impl_->run(op, resp);  // sink == null -> body accumulated in resp.body
-        if (!r) return r;
+        Result r = impl_->run(op, resp); // sink == null -> body accumulated in resp.body
+        if (!r)
+            return r;
 
         detail::ListPage page;
         if (!detail::parseListPage(resp.body, page))
             return Result{Error{ErrorKind::parse, int(resp.status), "",
-                                "cannot parse ListObjectsV2 response", 0}, 0};
+                                "cannot parse ListObjectsV2 response", 0},
+                          0};
         for (const auto& e : page.entries) {
             ObjectInfo info;
-            info.key = detail::urlDecode(e.key);  // encoding-type=url
+            info.key = detail::urlDecode(e.key); // encoding-type=url
             info.size = e.size;
             info.etag = e.etag;
             info.isPrefix = e.isPrefix;
-            if (!onObject(info)) return Result{};  // caller stop is not an error
+            if (!onObject(info))
+                return Result{}; // caller stop is not an error
         }
-        if (!page.truncated) return Result{};
+        if (!page.truncated)
+            return Result{};
         if (page.nextToken.empty() || page.nextToken == token)
             return Result{Error{ErrorKind::parse, 0, "",
-                                "truncated listing without a fresh continuation token", 0}, 0};
+                                "truncated listing without a fresh continuation token", 0},
+                          0};
         token = page.nextToken;
     }
 }

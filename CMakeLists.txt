@@ -30,12 +30,20 @@ endif()
 include(GNUInstallDirs)
 install(TARGETS slims3 EXPORT slims3-targets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(DIRECTORY include/slims3 DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(EXPORT slims3-targets NAMESPACE slims3:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/slims3)
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/slims3Config.cmake
     "include(CMakeFindDependencyMacro)\nfind_dependency(CURL)\ninclude(\"\${CMAKE_CURRENT_LIST_DIR}/slims3-targets.cmake\")\n")
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/slims3Config.cmake
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/slims3)
+
+include(CMakePackageConfigHelpers)
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/slims3ConfigVersion.cmake"
+    COMPATIBILITY SameMajorVersion)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/slims3ConfigVersion.cmake
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/slims3)
 
 if(SLIMS3_BUILD_TESTS)

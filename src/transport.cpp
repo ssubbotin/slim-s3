@@ -27,6 +27,7 @@ struct CbCtx {
     HttpResponse* resp = nullptr;
     std::atomic<bool>* cancel = nullptr;
     bool aborted = false;
+    bool overflowed = false;
     bool metaFilled = false;
     std::size_t bodyOff = 0;
 };
@@ -57,12 +58,18 @@ size_t onWrite(char* buf, size_t size, size_t nmemb, void* ud) {
     size_t len = size * nmemb;
     long status = 0;
     curl_easy_getinfo(ctx->handle, CURLINFO_RESPONSE_CODE, &status);
-    if (status >= 400 || !ctx->req->sink) {
-        // Error body (for S3 error parsing) or caller wants the whole body.
-        // Cap accumulation to keep a hostile server from ballooning memory.
+    bool success = (status >= 200 && status < 300);
+    if (!success || !ctx->req->sink) {
+        // Error/diagnostic body (S3 error XML, a redirect body we refuse to
+        // hand to the sink, or the caller wants the whole body). Cap
+        // accumulation to keep a hostile server from ballooning memory; going
+        // over the cap aborts the transfer loudly instead of truncating.
         constexpr size_t kCap = 8 * 1024 * 1024;
-        if (ctx->resp->body.size() < kCap)
-            ctx->resp->body.append(buf, std::min(len, kCap - ctx->resp->body.size()));
+        if (ctx->resp->body.size() + len > kCap) {
+            ctx->overflowed = true;
+            return 0; // CURLE_WRITE_ERROR
+        }
+        ctx->resp->body.append(buf, len);
         return len;
     }
     if (ctx->req->meta && !ctx->metaFilled) {
@@ -201,6 +208,22 @@ int Transport::execute(const HttpRequest& req, HttpResponse& resp, std::atomic<b
                        bool& aborted, std::string& curlError) {
     auto* st = static_cast<TransportState*>(state_);
     CURL* h = st->handle;
+    if (!h) {
+        // curl_easy_init() failed in the constructor; report instead of
+        // dereferencing a null handle below.
+        curlError = "curl_easy_init failed";
+        aborted = false;
+        return int(CURLE_FAILED_INIT);
+    }
+    // The HTTP method is routed purely from req.body/req.noBody below: a non-
+    // null body implies CURLOPT_UPLOAD (PUT). PUT therefore requires a
+    // non-null body pointer even for empty payloads, or curl silently issues
+    // a GET instead.
+    if (req.method == "PUT" && req.body == nullptr) {
+        curlError = "PUT without a body pointer (internal invariant)";
+        aborted = false;
+        return int(CURLE_FAILED_INIT);
+    }
     // Reset options but keep the handle: libcurl's connection/DNS/TLS caches
     // live on the handle and survive curl_easy_reset, so requests reuse
     // connections instead of reconnecting every time.
@@ -262,11 +285,18 @@ int Transport::execute(const HttpRequest& req, HttpResponse& resp, std::atomic<b
     curl_slist_free_all(hdrs);
 
     // HEAD/empty-body responses never hit onWrite; fill meta from headers here.
-    if (req.meta && !ctx.metaFilled && resp.status < 400)
+    // Gated on 2xx: a redirect's headers must not populate meta either.
+    if (req.meta && !ctx.metaFilled && resp.status >= 200 && resp.status < 300)
         metaFromHeaders(resp, *req.meta);
 
     aborted = ctx.aborted;
     curlError = errbuf[0] ? errbuf : (rc != CURLE_OK ? curl_easy_strerror(rc) : "");
+    if (ctx.overflowed) {
+        // aborted stays false: this must map to ErrorKind::transport, not
+        // ErrorKind::cancelled (which is reserved for user/cancel-flag/sink
+        // refusal aborts).
+        curlError = "response body exceeded the 8 MiB in-memory cap";
+    }
     return int(rc);
 }
 
