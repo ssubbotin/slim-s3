@@ -87,3 +87,28 @@ TEST_CASE("mapError: 204 (delete) stays inside the [200,300) success boundary") 
     auto e = mapError(0, false, "", r, "");
     CHECK(e.kind == ErrorKind::none);
 }
+
+TEST_CASE("mapError: below-200 status is an error, not success") {
+    HttpResponse r;
+    r.status = 100;
+    auto e = mapError(0, false, "", r, "");
+    CHECK(e.kind == ErrorKind::http);
+    CHECK(e.httpStatus == 100);
+}
+
+TEST_CASE("mapError: transport failure with empty curlError falls back to a generic message") {
+    HttpResponse r;
+    auto e = mapError(int(CURLE_COULDNT_CONNECT), false, "", r, "");
+    CHECK(e.kind == ErrorKind::transport);
+    CHECK(e.message == "transport failure");
+}
+
+TEST_CASE("mapError: S3 error body with empty Message falls back to the code") {
+    HttpResponse r;
+    r.status = 503;
+    r.body = "<Error><Code>SlowDown</Code><Message></Message></Error>";
+    auto e = mapError(0, false, "", r, "");
+    CHECK(e.kind == ErrorKind::s3);
+    CHECK(e.s3Code == "SlowDown");
+    CHECK(e.message == "SlowDown");
+}

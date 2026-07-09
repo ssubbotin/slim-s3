@@ -61,7 +61,10 @@ std::string xmlUnescape(std::string_view s) {
             long code = (ent.size() > 1 && (ent[1] == 'x' || ent[1] == 'X'))
                             ? std::strtol(std::string(ent.substr(2)).c_str(), nullptr, 16)
                             : std::strtol(std::string(ent.substr(1)).c_str(), nullptr, 10);
-            if (code <= 0 || code > 0x10FFFF) {
+            // Surrogates (0xD800-0xDFFF) are not valid Unicode scalar values and
+            // must never be encoded to UTF-8; reject them the same way as any
+            // other out-of-range code point.
+            if (code <= 0 || code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF)) {
                 out += s[i++];
                 continue;
             }

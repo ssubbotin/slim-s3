@@ -1,3 +1,5 @@
+#include <curl/curl.h>
+
 #include "doctest.h"
 #include "transport.hpp"
 
@@ -47,4 +49,28 @@ TEST_CASE("HttpResponse::find and metaFromHeaders") {
     CHECK(m.contentEncoding == "zstd");
     CHECK(m.info.size == 9672);
     CHECK(m.info.etag == "9bb58f26192e4ba00f01e2e7b136bbd8");
+}
+
+TEST_CASE("Transport::execute: PUT without a body pointer is rejected before any network I/O") {
+    slims3::Config cfg;
+    cfg.endpoint = "http://127.0.0.1:1"; // would refuse to connect if this ever reached curl
+    Transport tr(cfg);
+
+    HttpRequest req;
+    req.method = "PUT";
+    req.url = "http://127.0.0.1:1/bucket/key";
+    req.body = nullptr;
+    req.bodyLen = 0;
+    req.noBody = false;
+
+    HttpResponse resp;
+    std::atomic<bool> cancel{false};
+    bool aborted = true; // pre-set to a value the guard must overwrite
+    std::string curlError;
+    int rc = tr.execute(req, resp, cancel, aborted, curlError);
+
+    CHECK(rc == int(CURLE_FAILED_INIT));
+    CHECK_FALSE(aborted);
+    CHECK(curlError.find("PUT without a body pointer") != std::string::npos);
+    CHECK(resp.status == 0); // never even started the transfer
 }

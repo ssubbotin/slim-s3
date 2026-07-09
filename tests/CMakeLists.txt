@@ -7,6 +7,7 @@ add_executable(slims3_tests
     test_xml.cpp
     test_transport.cpp
     test_client_mapping.cpp
+    test_client_edge.cpp
     test_header_validation.cpp
 )
 target_link_libraries(slims3_tests PRIVATE slims3)

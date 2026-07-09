@@ -65,6 +65,30 @@ TEST_CASE("xmlUnescape: predefined entities and numeric refs") {
     CHECK(xmlUnescape("&bogus;") == "&bogus;"); // unknown entity left as-is
 }
 
+TEST_CASE("xmlUnescape: multi-byte UTF-8 numeric refs") {
+    CHECK(xmlUnescape("&#233;") == "\xC3\xA9");            // e-acute, 2-byte UTF-8
+    CHECK(xmlUnescape("&#20013;") == "\xE4\xB8\xAD");      // CJK "middle", 3-byte UTF-8
+    CHECK(xmlUnescape("&#128512;") == "\xF0\x9F\x98\x80"); // grinning face, 4-byte UTF-8
+}
+
+TEST_CASE("xmlUnescape: UTF-16 surrogates are rejected, not encoded") {
+    // Surrogates are not valid Unicode scalar values and must never be
+    // encoded to UTF-8; the reference is emitted literally, same as any
+    // other invalid/unknown entity.
+    CHECK(xmlUnescape("&#xD800;") == "&#xD800;");
+    CHECK(xmlUnescape("&#xDFFF;") == "&#xDFFF;");
+}
+
+TEST_CASE("xmlUnescape: out-of-range numeric refs are rejected") {
+    CHECK(xmlUnescape("&#0;") == "&#0;");
+    CHECK(xmlUnescape("&#x110000;") == "&#x110000;");
+}
+
+TEST_CASE("xmlUnescape: hostile fallbacks") {
+    CHECK(xmlUnescape("a&b") == "a&b");                               // bare '&', no ';'
+    CHECK(xmlUnescape("&abcdefghijklmnop;") == "&abcdefghijklmnop;"); // entity name >10 chars
+}
+
 TEST_CASE("hostile input fails cleanly") {
     ListPage p;
     CHECK_FALSE(parseListPage("<ListBucketResult><Contents><Key>a", p)); // unclosed tag
@@ -72,4 +96,26 @@ TEST_CASE("hostile input fails cleanly") {
     CHECK_FALSE(parseListPage("<ListBucketResult><CommonPrefixes><Prefix>a", p2)); // unclosed tag
     S3ErrorBody e;
     CHECK_FALSE(parseErrorBody("", e));
+}
+
+TEST_CASE("parseListPage: rejections without a ListBucketResult / missing mandatory children") {
+    ListPage p;
+    CHECK_FALSE(parseListPage("<NotAListing><Contents><Key>a</Key></Contents></NotAListing>", p));
+    ListPage p2;
+    CHECK_FALSE(parseListPage(
+        "<ListBucketResult><Contents><Size>1</Size></Contents></ListBucketResult>", p2));
+    ListPage p3;
+    CHECK_FALSE(
+        parseListPage("<ListBucketResult><CommonPrefixes><Delimiter>/</Delimiter></CommonPrefixes>"
+                      "</ListBucketResult>",
+                      p3));
+}
+
+TEST_CASE("parseListPage: unquoted ETag is parsed as-is") {
+    ListPage p;
+    REQUIRE(parseListPage("<ListBucketResult><Contents><Key>k</Key><ETag>abc123</ETag></Contents>"
+                          "</ListBucketResult>",
+                          p));
+    REQUIRE(p.entries.size() == 1);
+    CHECK(p.entries[0].etag == "abc123");
 }

@@ -43,7 +43,7 @@ TEST_CASE("authorization: PUT with body, content-type, content-encoding, key wit
     p.canonicalUri = "/b/k%20ey";
     p.canonicalQuery = "";
     p.headers = {{"host", "127.0.0.1:9000"},
-                 {"Content-Type", "application/octet-stream"},   // mixed case on purpose
+                 {"Content-Type", "application/octet-stream"}, // mixed case on purpose
                  {"Content-Encoding", "zstd"}};
     // sha256("hello world")
     p.payloadHashHex = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
@@ -72,6 +72,13 @@ TEST_CASE("authorization: HEAD, default port host, another region") {
           "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260709/eu-west-1/s3/aws4_request, "
           "SignedHeaders=host;x-amz-content-sha256;x-amz-date, "
           "Signature=3d8fc65224f33e12c6323386d84a1335721ea2012a919ca1bedb64bb9bbbf848");
+}
+
+TEST_CASE("canonicalRequest: header value with a run of spaces/tabs is collapsed") {
+    SignParams p = v1();
+    p.headers.emplace_back("x-amz-meta-note", "a    b\t\tc");
+    std::string canon = canonicalRequest(p);
+    CHECK(canon.find("x-amz-meta-note:a b c\n") != std::string::npos);
 }
 
 TEST_CASE("formatAmzDate") {
