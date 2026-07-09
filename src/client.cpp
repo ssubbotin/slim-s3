@@ -57,8 +57,12 @@ Error mapError(int curlCode, bool aborted, const std::string& curlError, const H
         S3ErrorBody body;
         if (parseErrorBody(resp.body, body)) {
             e.kind = ErrorKind::s3;
-            e.s3Code = body.code;
-            e.message = body.message.empty() ? body.code : body.message;
+            // body.code/body.message are attacker-controlled (the S3 error XML
+            // came straight from the server): sanitize both before they reach
+            // Error::message/s3Code, or well-formed error XML with CR/LF or
+            // terminal escapes in <Code>/<Message> could forge downstream logs.
+            e.s3Code = sanitizeForLog(body.code);
+            e.message = sanitizeForLog(body.message.empty() ? body.code : body.message);
         } else if (!headSynthCode.empty() && resp.status == 404) {
             e.kind = ErrorKind::s3;
             e.s3Code = headSynthCode;

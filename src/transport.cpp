@@ -29,9 +29,16 @@ struct CbCtx {
     bool aborted = false;
     bool overflowed = false;
     bool headersOverflowed = false;
+    bool statusLineOverflowed = false;
     bool metaFilled = false;
     std::size_t bodyOff = 0;
+    // headerBytes/headerCount are cumulative for the whole exchange: they must
+    // NOT be reset when a new status line clears the header vector below (see
+    // statusLineCount), or a server that keeps emitting interim/status-line
+    // blocks could ride that reset past the caps forever.
     std::size_t headerBytes = 0;
+    std::size_t headerCount = 0;
+    std::size_t statusLineCount = 0;
 };
 
 // Caps against a malicious/misbehaving server streaming endless response
@@ -39,18 +46,32 @@ struct CbCtx {
 // past anything a real S3-compatible server sends.
 constexpr std::size_t kMaxHeaderCount = 2000;
 constexpr std::size_t kMaxHeaderBytes = 1 * 1024 * 1024;
+// Cap on the number of status-line blocks ("HTTP/..." lines) in a single
+// exchange. A legitimate response has exactly one; we don't follow redirects
+// (FOLLOWLOCATION is off) and suppress Expect, so a stray 1xx like 103 Early
+// Hints adds at most a couple more. A server that streams interim responses
+// (or spoofed status lines) forever would otherwise reset headers.clear()
+// indefinitely -- memory stays bounded, but without this cap the exchange
+// never terminates even though the M1 byte/count caps above are cumulative
+// (a slowloris the low-speed stall guard doesn't catch with a trickle just
+// above its floor and operationTimeoutSec==0).
+constexpr std::size_t kMaxStatusLines = 32;
 
 size_t onHeader(char* buf, size_t size, size_t nitems, void* ud) {
     auto* ctx = static_cast<CbCtx*>(ud);
     size_t len = size * nitems;
     std::string line(buf, len);
     if (line.rfind("HTTP/", 0) == 0) {
-        ctx->resp->headers.clear(); // new response block (e.g. after redirect)
-        ctx->headerBytes = 0;
+        ctx->resp->headers.clear(); // new response block (e.g. after redirect); memory only
+        if (++ctx->statusLineCount > kMaxStatusLines) {
+            ctx->overflowed = true;
+            ctx->statusLineOverflowed = true;
+            return 0; // abort the transfer, same path as the other caps
+        }
         return len;
     }
     ctx->headerBytes += len;
-    if (ctx->resp->headers.size() >= kMaxHeaderCount || ctx->headerBytes > kMaxHeaderBytes) {
+    if (ctx->headerCount >= kMaxHeaderCount || ctx->headerBytes > kMaxHeaderBytes) {
         ctx->overflowed = true;
         ctx->headersOverflowed = true;
         return 0; // abort the transfer, same path as the body-size cap
@@ -65,6 +86,7 @@ size_t onHeader(char* buf, size_t size, size_t nitems, void* ud) {
         while (!value.empty() && (value.back() == '\r' || value.back() == '\n'))
             value.pop_back();
         ctx->resp->headers.emplace_back(std::move(name), std::move(value));
+        ++ctx->headerCount;
     }
     return len;
 }
@@ -329,8 +351,12 @@ int Transport::execute(const HttpRequest& req, HttpResponse& resp, std::atomic<b
         // aborted stays false: this must map to ErrorKind::transport, not
         // ErrorKind::cancelled (which is reserved for user/cancel-flag/sink
         // refusal aborts).
-        curlError = ctx.headersOverflowed ? "response headers exceeded limit"
-                                          : "response body exceeded the 8 MiB in-memory cap";
+        if (ctx.statusLineOverflowed)
+            curlError = "too many response header blocks (interim/redirect flood)";
+        else if (ctx.headersOverflowed)
+            curlError = "response headers exceeded limit";
+        else
+            curlError = "response body exceeded the 8 MiB in-memory cap";
     }
     return int(rc);
 }

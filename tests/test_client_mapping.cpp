@@ -42,6 +42,19 @@ TEST_CASE("mapError: S3 error body parsed") {
     CHECK(e.message == "nope");
 }
 
+TEST_CASE("mapError: S3 error message is sanitized against CRLF log forgery") {
+    HttpResponse r;
+    r.status = 403;
+    r.body = "<Error><Code>AccessDenied</Code>"
+             "<Message>line1\r\nFORGED: x</Message></Error>";
+    auto e = mapError(0, false, "", r, "");
+    CHECK(e.kind == ErrorKind::s3);
+    CHECK(e.s3Code == "AccessDenied"); // code itself has no control chars here
+    CHECK(e.message.find('\r') == std::string::npos);
+    CHECK(e.message.find('\n') == std::string::npos);
+    CHECK(e.message == "line1..FORGED: x");
+}
+
 TEST_CASE("mapError: HEAD 404 synthesizes the code") {
     HttpResponse r;
     r.status = 404; // HEAD: empty body
