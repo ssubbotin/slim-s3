@@ -431,7 +431,14 @@ Result Client::listObjects(const std::string& bucket, const std::string& prefix,
                           0};
         token = page.nextToken;
     }
+    // Defense-in-depth backstop: reaching this line requires a server handing
+    // out 100000 consecutive genuinely-fresh continuation tokens, which is
+    // impractical to exercise in finite CI time. The realistic abuse case
+    // (empty or repeated token) is covered by the guard above, exercised by
+    // the "list_empty_token" stub scenario.
+    // GCOVR_EXCL_START
     return Result{Error{ErrorKind::parse, 0, "", "listing exceeded maximum page count", 0}, 0};
+    // GCOVR_EXCL_STOP
 }
 
 } // namespace slims3

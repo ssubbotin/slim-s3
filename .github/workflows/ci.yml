@@ -68,6 +68,12 @@ jobs:
         run: tests/integration/run.sh http://127.0.0.1:19000 testkey testsecret123
       - name: Run against RustFS
         run: tests/integration/run.sh http://127.0.0.1:19010 testkey testsecret123
+      - name: Stub scenarios (malicious/misbehaving-server caps and list edge cases)
+        run: |
+          for s in header_count_flood header_byte_flood status_line_flood body_overflow \
+                   delete_404 list_bad_xml list_empty_token list_page_fail put_500 ok; do
+            tests/integration/run_stub.sh "$s"
+          done
 
   coverage:
     runs-on: ubuntu-24.04
@@ -122,6 +128,14 @@ jobs:
         run: tests/integration/run.sh http://127.0.0.1:19010 testkey testsecret123
       - name: Silent-server regression
         run: tests/integration/run.sh --silent
+      # Same stub scenarios as the integration job: without these, the
+      # transport.cpp cap/overflow-message branches show as uncovered here.
+      - name: Stub scenarios (malicious/misbehaving-server caps and list edge cases)
+        run: |
+          for s in header_count_flood header_byte_flood status_line_flood body_overflow \
+                   delete_404 list_bad_xml list_empty_token list_page_fail put_500 ok; do
+            tests/integration/run_stub.sh "$s"
+          done
       - name: Generate coverage report (branch coverage, library code only)
         run: |
           mkdir -p coverage
