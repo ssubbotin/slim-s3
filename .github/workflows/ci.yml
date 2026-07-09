@@ -68,3 +68,70 @@ jobs:
         run: tests/integration/run.sh http://127.0.0.1:19000 testkey testsecret123
       - name: Run against RustFS
         run: tests/integration/run.sh http://127.0.0.1:19010 testkey testsecret123
+
+  coverage:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev gcovr
+      - name: Check gcovr version (fall back to pip if apt's is too old for --html-details/branch coverage)
+        run: |
+          gcovr --version
+          if ! gcovr --help | grep -q -- '--html-details'; then
+            pipx install gcovr || pip install --user gcovr
+          fi
+      - name: Configure (instrumented build)
+        run: |
+          cmake -B build -DSLIMS3_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="--coverage -O0 -g" \
+            -DCMAKE_EXE_LINKER_FLAGS="--coverage"
+      - run: cmake --build build -j
+      - name: Run unit tests
+        run: ctest --test-dir build -LE integration --output-on-failure
+      # NOTE: minio/minio:latest and rustfs/rustfs:latest are floating tags,
+      # not pinned by digest, same as the integration job above.
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 19000:9000 \
+            -e MINIO_ROOT_USER=testkey -e MINIO_ROOT_PASSWORD=testsecret123 \
+            minio/minio:latest server /data
+      - name: Start RustFS
+        run: |
+          docker run -d --name rustfs -p 19010:9000 \
+            -e RUSTFS_ADDRESS=0.0.0.0:9000 \
+            -e RUSTFS_ACCESS_KEY=testkey -e RUSTFS_SECRET_KEY=testsecret123 \
+            rustfs/rustfs:latest
+      - name: Wait for servers
+        run: |
+          for p in 19000 19010; do
+            for i in $(seq 1 30); do
+              curl -sf "http://127.0.0.1:$p" -o /dev/null && break || true
+              # any HTTP response (incl. 403) means the port is serving
+              code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$p" || echo 000)
+              [ "$code" != "000" ] && break
+              sleep 2
+            done
+          done
+      # Coverage from unit tests alone would show the transport.cpp/client.cpp
+      # network paths as uncovered; running the integration binary against both
+      # servers (plus the silent-server regression) here is what makes the
+      # coverage numbers below meaningful for those paths.
+      - name: Run against MinIO
+        run: tests/integration/run.sh http://127.0.0.1:19000 testkey testsecret123
+      - name: Run against RustFS
+        run: tests/integration/run.sh http://127.0.0.1:19010 testkey testsecret123
+      - name: Silent-server regression
+        run: tests/integration/run.sh --silent
+      - name: Generate coverage report (branch coverage, library code only)
+        run: |
+          mkdir -p coverage
+          gcovr --root . --filter 'src/' --filter 'include/' --exclude 'tests/' \
+            --exclude-unreachable-branches --decisions \
+            --html-details coverage/index.html \
+            --xml coverage/coverage.xml \
+            --txt coverage/summary.txt \
+            --print-summary
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/

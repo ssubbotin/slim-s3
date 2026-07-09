@@ -264,13 +264,14 @@ int Transport::execute(const HttpRequest& req, HttpResponse& resp, std::atomic<b
                        bool& aborted, std::string& curlError) {
     auto* st = static_cast<TransportState*>(state_);
     CURL* h = st->handle;
-    if (!h) {
+    if (!h) { // GCOVR_EXCL_START
         // curl_easy_init() failed in the constructor; report instead of
-        // dereferencing a null handle below.
+        // dereferencing a null handle below. Unreachable in any test: curl_easy_init()
+        // only returns null on allocation failure (OOM), which cannot be forced from a test.
         curlError = "curl_easy_init failed";
         aborted = false;
         return int(CURLE_FAILED_INIT);
-    }
+    } // GCOVR_EXCL_STOP
     // The HTTP method is routed purely from req.body/req.noBody below: a non-
     // null body implies CURLOPT_UPLOAD (PUT). PUT therefore requires a
     // non-null body pointer even for empty payloads, or curl silently issues
