@@ -85,7 +85,11 @@ std::string authorizationHeader(const SignParams& p) {
 
 std::string formatAmzDate(std::time_t t) {
     std::tm tm{};
+#ifdef _WIN32
+    gmtime_s(&tm, &t); // MSVC has no gmtime_r (and its gmtime_s reverses the args)
+#else
     gmtime_r(&t, &tm);
+#endif
     char buf[32];
     std::strftime(buf, sizeof buf, "%Y%m%dT%H%M%SZ", &tm);
     return buf;

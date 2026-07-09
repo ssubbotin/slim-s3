@@ -23,7 +23,7 @@ struct Config {
 
     std::string caBundlePath;          // optional custom CA bundle
     bool tlsVerify = true;
-    std::string userAgent = "slim-s3/0.1";
+    std::string userAgent;             // empty -> "slim-s3/<library version>"
 };
 
 enum class ErrorKind {
@@ -77,6 +77,7 @@ class Client {
 public:
     explicit Client(Config cfg);
     ~Client();
+    // Movable. A moved-from Client may only be destroyed or assigned to.
     Client(Client&&) noexcept;
     Client& operator=(Client&&) noexcept;
     Client(const Client&) = delete;

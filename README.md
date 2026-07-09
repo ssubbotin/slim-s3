@@ -135,7 +135,7 @@ See [docs/DESIGN.md](docs/DESIGN.md) §7 for the full concurrency model.
 slim-s3 aims to be the boring, dependable middle:
 
 - C++17, libcurl as the only dependency (own SigV4 signing, vendored SHA-256)
-- the whole library adds **~165 KB** to a stripped Release binary (x86-64 Linux,
+- the whole library adds **~180 KB** to a stripped Release binary (x86-64 Linux,
   gcc `-O2`) — run `tools/size-report.sh` for the number on your toolchain plus
   a per-source-file breakdown
 - timeouts and a low-speed stall guard **on by default** — nothing hangs forever

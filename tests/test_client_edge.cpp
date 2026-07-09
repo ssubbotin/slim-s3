@@ -99,6 +99,104 @@ TEST_CASE("Client::putObject: null data with zero length is the explicit empty-b
     CHECK(r.error.message.find("bad endpoint") != std::string::npos);
 }
 
+TEST_CASE("Client: empty object key is rejected before network for every object op") {
+    // Without this guard an empty key silently retargets the operation at the
+    // bucket itself: deleteObject(b, "") would send DELETE /b (DeleteBucket!),
+    // putObject(b, "") would send PUT /b, getObject(b, "") would stream the
+    // bucket listing XML into the sink.
+    Client c(baseConfig("http://127.0.0.1:1"));
+
+    auto checkRejected = [](const Result& r) {
+        CHECK_FALSE(bool(r));
+        CHECK(r.error.kind == ErrorKind::transport);
+        CHECK(r.error.message == "empty object key");
+        CHECK(r.error.httpStatus == 0); // no network I/O happened
+    };
+
+    checkRejected(c.putObject("b", "", "x", 1));
+    checkRejected(c.putFile("b", "", "/nonexistent-file"));
+    WriteFn sink = [](const char*, std::size_t) { return true; };
+    checkRejected(c.getObject("b", "", sink));
+    checkRejected(c.getToFile("b", "", "/tmp/slims3-edge-test.bin"));
+    ObjectMeta meta;
+    checkRejected(c.statObject("b", "", meta));
+    checkRejected(c.deleteObject("b", ""));
+}
+
+TEST_CASE("Client: invalid bucket name is rejected before network for every op") {
+    Client c(baseConfig("http://127.0.0.1:1"));
+
+    auto checkRejected = [](const Result& r) {
+        CHECK_FALSE(bool(r));
+        CHECK(r.error.kind == ErrorKind::transport);
+        CHECK(r.error.message == "invalid bucket name");
+        CHECK(r.error.httpStatus == 0);
+    };
+
+    bool exists = true;
+    checkRejected(c.bucketExists("", exists));
+    CHECK_FALSE(exists); // out-param still reset on the early return
+    checkRejected(c.createBucket(""));
+    // A slash would silently retarget the request (bucket "b", key "x");
+    // '?' / '#' / space would corrupt the URL vs the signed canonical URI.
+    checkRejected(c.putObject("b/x", "k", "x", 1));
+    checkRejected(c.deleteObject("b?x", "k"));
+    ObjectMeta meta;
+    checkRejected(c.statObject("b#x", "k", meta));
+    checkRejected(c.bucketExists("my bucket", exists));
+    checkRejected(c.createBucket("b\x01"));
+    checkRejected(c.listObjects("", "", true, [](const ObjectInfo&) { return true; }));
+}
+
+TEST_CASE("Client: well-formed bucket names pass the guard") {
+    // ftp:// endpoint: a bucket that passes validation reaches Impl::run and
+    // fails there with "bad endpoint" -- proving the guard did not fire.
+    Client c(baseConfig("ftp://x"));
+    Result r = c.createBucket("My_Bucket-1.x");
+    CHECK_FALSE(bool(r));
+    CHECK(r.error.message.find("bad endpoint") != std::string::npos);
+}
+
+TEST_CASE("Client::putObject: duplicate header names are rejected before network") {
+    // SigV4 requires repeated header values to be comma-joined under one name;
+    // emitting the name twice guarantees a server-side SignatureDoesNotMatch.
+    Client c(baseConfig("http://127.0.0.1:1"));
+
+    PutOptions po;
+    po.extraHeaders.emplace_back("X-Amz-Meta-A", "1");
+    po.extraHeaders.emplace_back("x-amz-meta-a", "2"); // same name, case-insensitively
+    Result r = c.putObject("b", "k", "x", 1, po);
+    CHECK_FALSE(bool(r));
+    CHECK(r.error.kind == ErrorKind::transport);
+    CHECK(r.error.message == "duplicate header name");
+
+    PutOptions po2;
+    po2.contentType = "text/plain";
+    po2.extraHeaders.emplace_back("Content-Type", "application/json"); // collides with the option
+    Result r2 = c.putObject("b", "k", "x", 1, po2);
+    CHECK_FALSE(bool(r2));
+    CHECK(r2.error.message == "duplicate header name");
+}
+
+TEST_CASE("Client::putObject: headers managed by the library are rejected before network") {
+    Client c(baseConfig("http://127.0.0.1:1"));
+    for (const char* name : {"Host", "authorization", "X-Amz-Date", "x-amz-content-sha256",
+                             "Content-Length", "Transfer-Encoding", "Expect"}) {
+        PutOptions po;
+        po.extraHeaders.emplace_back(name, "v");
+        Result r = c.putObject("b", "k", "x", 1, po);
+        CHECK_FALSE(bool(r));
+        CHECK(r.error.kind == ErrorKind::transport);
+        CHECK(r.error.message == "reserved header name (set by the library)");
+    }
+}
+
+TEST_CASE("Config: default userAgent is empty (transport substitutes slim-s3/<version>)") {
+    // The versioned default lives in the library build (SLIMS3_VERSION from
+    // CMake), not hardcoded in the public header where it would drift.
+    CHECK(Config{}.userAgent.empty());
+}
+
 TEST_CASE("Client::putObject: valid extraHeaders are copied into the request") {
     // Same bad-endpoint trick: extraHdrs.push_back runs before the network
     // call, so this covers the valid-input population loop without a server.

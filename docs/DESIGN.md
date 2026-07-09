@@ -84,7 +84,7 @@ struct Config {
 
     std::string caBundlePath;         // optional custom CA bundle
     bool tlsVerify = true;
-    std::string userAgent = "slim-s3/<version>";
+    std::string userAgent;            // empty -> "slim-s3/<library version>"
 };
 
 enum class ErrorKind {
@@ -198,6 +198,24 @@ is rejected, and header names additionally reject `:`. A caller forwarding
 untrusted values (e.g. proxied `x-amz-meta-*` metadata) cannot inject extra
 header lines or corrupt the signature this way; a rejected header returns
 `ErrorKind::transport` before any network I/O.
+
+The same pre-network validation covers the request target and header set:
+
+- **Bucket names** must be non-empty and within `[A-Za-z0-9._-]` (a deliberate
+  superset of AWS's official `[a-z0-9.-]` — legacy buckets and some
+  S3-compatible stores allow more; strictness beyond URL/signature safety is
+  the server's job). Anything else — a slash (would silently retarget:
+  bucket `"b/x"` becomes bucket `b`, key `x`), `?`/`#` (starts the
+  query/fragment early), `%`, spaces, control bytes — is rejected.
+- **Object keys** must be non-empty for every object-level operation. Without
+  this, `deleteObject(bucket, "")` would send `DELETE /{bucket}` — the
+  DeleteBucket operation — and `putObject`/`getObject` with an empty key would
+  create the bucket / stream the bucket listing into the sink.
+- **Duplicate and library-managed header names** are rejected: SigV4 requires
+  a repeated header's values to be comma-joined under one name, so emitting a
+  name twice guarantees `SignatureDoesNotMatch`; and `host`, `authorization`,
+  `x-amz-date`, `x-amz-content-sha256`, `content-length`,
+  `transfer-encoding`, and `expect` are set by the library.
 
 `Result.bytesTransferred` is the object body size moved over the wire (uploads:
 bytes sent; downloads: bytes written to sink/file) — callers can verify it against
@@ -333,9 +351,13 @@ retryable; 4xx → usually fatal) without the library imposing one.
   (including the surrogate-rejection case above), truncated and hostile
   inputs (must fail cleanly, never crash).
 - Header-name/value validation (`validHeaderToken`): CR/LF/NUL rejection, `:`
-  rejection in names, accepted-vs-rejected boundary cases.
-- Client-level mapping and edge cases: endpoint parsing, null-data PUT, HEAD
-  404 code synthesis, delete-of-missing-key success.
+  rejection in names, accepted-vs-rejected boundary cases; bucket-name
+  validation (`validBucketName`) boundary cases; duplicate/reserved header
+  rejection.
+- Client-level mapping and edge cases: endpoint parsing (explicit scheme
+  required, IPv6 literals, malformed inputs), null-data PUT, empty-key and
+  invalid-bucket rejection for every operation, HEAD 404 code synthesis,
+  delete-of-missing-key success.
 
 **Integration (docker, run in CI):** matrix over **MinIO** and **RustFS**, plus a
 raw-socket malicious/misbehaving-server stub (`tests/integration/stub_server.py`):
@@ -402,14 +424,30 @@ built, so a caller forwarding untrusted values (e.g. proxied `x-amz-meta-*`
 metadata) cannot inject extra header lines or corrupt the signature this way.
 Rejection returns `ErrorKind::transport` with no network I/O performed.
 
+Beyond header tokens (all rejected the same way, before any network I/O; see
+§4 for the full rules): bucket names are validated with `validBucketName`,
+object keys must be non-empty (an empty key would retarget the request at the
+bucket itself — `DELETE /{bucket}` is DeleteBucket), and duplicate or
+library-managed header names in `PutOptions` are rejected.
+
+**Endpoint parsing.** The endpoint must carry an explicit `http://` or
+`https://` scheme — a scheme-less endpoint is rejected rather than silently
+defaulting to plaintext HTTP (this client carries credentials). Bracketed
+IPv6 literals are supported (`http://[::1]:9000`, `https://[2001:db8::1]`);
+the brackets remain part of the host in both the URL and the signed `host`
+header. No path suffix is allowed (path-style addressing owns the path).
+
 **`getToFile` atomicity.** The temp file is opened with
 `O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW` (mode 0600) on POSIX: `O_EXCL` refuses to
 reuse a pre-existing path — including a stale `.part` left by a crashed prior
 download, which now blocks the new download with a clear error instead of
 being silently truncated — and `O_NOFOLLOW` refuses to follow a pre-planted
-symlink. The file is renamed over the destination only when the transfer and
-the final `fflush` both succeed; it is removed on any failure, cancellation,
-or write error. Windows v1 falls back to a plain `fopen` (no O_EXCL/O_NOFOLLOW
+symlink. The file is renamed over the destination only when the transfer, the
+final `fflush`, and an `fsync` all succeed — the `fsync` closes the classic
+rename-durability gap where a crash shortly after success leaves a truncated
+file under the final name (`rename` is atomic in the namespace but does not
+flush data blocks). The temp file is removed on any failure, cancellation, or
+write error. Windows v1 falls back to a plain `fopen` (no O_EXCL/O_NOFOLLOW
 equivalent wired up yet) — CI and the hardening above currently target Linux.
 
 **Cancellation & progress.** `cancel()` sets an atomic flag read by the

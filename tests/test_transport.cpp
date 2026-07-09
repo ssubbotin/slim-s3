@@ -22,15 +22,40 @@ TEST_CASE("parseEndpoint") {
     CHECK(e.hostHeader() == "s3.example.com");
     CHECK(e.baseUrl() == "https://s3.example.com");
 
-    REQUIRE(parseEndpoint("minio.local", e, err)); // scheme defaults to http
-    CHECK(e.scheme == "http");
-    CHECK(e.port == 80);
-    CHECK(e.hostHeader() == "minio.local");
+    // A scheme-less endpoint must NOT silently default to plaintext http --
+    // for a client carrying credentials that's a security foot-gun, not a
+    // convenience. Require the caller to say http:// or https:// explicitly.
+    CHECK_FALSE(parseEndpoint("minio.local", e, err));
+    CHECK(err.find("scheme") != std::string::npos);
+    CHECK_FALSE(parseEndpoint("minio.local:9000", e, err));
 
     CHECK_FALSE(parseEndpoint("", e, err));
     CHECK_FALSE(parseEndpoint("ftp://x", e, err));
     CHECK_FALSE(parseEndpoint("http://host:notaport", e, err));
     CHECK_FALSE(parseEndpoint("http://host/path", e, err)); // path suffix not supported in v1
+}
+
+TEST_CASE("parseEndpoint: IPv6 literals") {
+    Endpoint e;
+    std::string err;
+
+    REQUIRE(parseEndpoint("http://[::1]:9000", e, err));
+    CHECK(e.host == "[::1]");
+    CHECK(e.port == 9000);
+    CHECK_FALSE(e.isDefaultPort);
+    CHECK(e.hostHeader() == "[::1]:9000"); // brackets kept: valid in URLs and Host headers
+    CHECK(e.baseUrl() == "http://[::1]:9000");
+
+    REQUIRE(parseEndpoint("https://[2001:db8::1]", e, err)); // no port -> scheme default
+    CHECK(e.host == "[2001:db8::1]");
+    CHECK(e.port == 443);
+    CHECK(e.isDefaultPort);
+    CHECK(e.hostHeader() == "[2001:db8::1]");
+
+    CHECK_FALSE(parseEndpoint("http://[::1", e, err));       // unterminated bracket
+    CHECK_FALSE(parseEndpoint("http://[]:9000", e, err));    // empty address
+    CHECK_FALSE(parseEndpoint("http://[::1]9000", e, err));  // junk after bracket
+    CHECK_FALSE(parseEndpoint("http://[::1]:", e, err));     // colon without a port
 }
 
 TEST_CASE("HttpResponse::find and metaFromHeaders") {

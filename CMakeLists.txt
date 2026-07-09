@@ -23,6 +23,8 @@ target_include_directories(slims3 PUBLIC
     $<INSTALL_INTERFACE:include>)
 target_link_libraries(slims3 PUBLIC CURL::libcurl)
 target_compile_features(slims3 PUBLIC cxx_std_17)
+# Feeds the default User-Agent ("slim-s3/<version>"); see transport.cpp.
+target_compile_definitions(slims3 PRIVATE SLIMS3_VERSION="${PROJECT_VERSION}")
 if(NOT MSVC)
     target_compile_options(slims3 PRIVATE -Wall -Wextra)
 endif()

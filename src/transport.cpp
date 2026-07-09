@@ -4,8 +4,13 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
+
+#ifndef SLIMS3_VERSION // set by CMake; fallback for non-CMake builds
+#define SLIMS3_VERSION "unknown"
+#endif
 
 namespace slims3::detail {
 namespace {
@@ -167,10 +172,14 @@ bool parseEndpoint(std::string_view s, Endpoint& out, std::string& err) {
     out = Endpoint{};
     std::string rest(s);
     auto sep = rest.find("://");
-    if (sep != std::string::npos) {
-        out.scheme = rest.substr(0, sep);
-        rest = rest.substr(sep + 3);
+    if (sep == std::string::npos) {
+        // No silent default to plaintext http: this client carries
+        // credentials, so the caller must pick the scheme explicitly.
+        err = "endpoint must include a scheme (http:// or https://)";
+        return false;
     }
+    out.scheme = rest.substr(0, sep);
+    rest = rest.substr(sep + 3);
     if (out.scheme != "http" && out.scheme != "https") {
         err = "endpoint scheme must be http or https";
         return false;
@@ -179,20 +188,48 @@ bool parseEndpoint(std::string_view s, Endpoint& out, std::string& err) {
         err = "endpoint must not contain a path";
         return false;
     }
-    auto colon = rest.rfind(':');
-    if (colon != std::string::npos) {
-        std::string p = rest.substr(colon + 1);
+    std::string portStr;
+    bool hasPort = false;
+    if (!rest.empty() && rest.front() == '[') {
+        // Bracketed IPv6 literal, e.g. "[::1]" or "[2001:db8::1]:9000". The
+        // brackets stay part of `host`: both URLs and Host headers need them.
+        auto rb = rest.find(']');
+        if (rb == std::string::npos || rb < 2) {
+            err = "invalid IPv6 endpoint host";
+            return false;
+        }
+        out.host = rest.substr(0, rb + 1);
+        std::string after = rest.substr(rb + 1);
+        if (!after.empty()) {
+            if (after.front() != ':') {
+                err = "invalid endpoint (unexpected characters after IPv6 host)";
+                return false;
+            }
+            hasPort = true;
+            portStr = after.substr(1);
+        }
+    } else {
+        auto colon = rest.rfind(':');
+        if (colon != std::string::npos) {
+            hasPort = true;
+            portStr = rest.substr(colon + 1);
+            out.host = rest.substr(0, colon);
+        } else {
+            out.host = rest;
+        }
+    }
+    if (hasPort) {
         char* endp = nullptr;
-        long v = std::strtol(p.c_str(), &endp, 10);
-        if (p.empty() || *endp != '\0' || v < 1 || v > 65535) {
+        long v = std::strtol(portStr.c_str(), &endp, 10);
+        // isdigit guard: strtol would silently accept leading whitespace/'+'.
+        if (portStr.empty() || !std::isdigit((unsigned char)portStr.front()) || *endp != '\0' ||
+            v < 1 || v > 65535) {
             err = "invalid endpoint port";
             return false;
         }
         out.port = int(v);
-        out.host = rest.substr(0, colon);
     } else {
         out.port = (out.scheme == "https") ? 443 : 80;
-        out.host = rest;
     }
     if (out.host.empty()) {
         err = "endpoint host is empty";
@@ -251,7 +288,10 @@ Transport::Transport(const slims3::Config& cfg) {
     st->lowSpeedTimeSec = cfg.lowSpeedTimeSec;
     st->caBundlePath = cfg.caBundlePath;
     st->tlsVerify = cfg.tlsVerify;
-    st->userAgent = cfg.userAgent;
+    // The versioned default lives here (SLIMS3_VERSION comes from CMake's
+    // project version) rather than hardcoded in the public header, where it
+    // would drift from the actual library version.
+    st->userAgent = cfg.userAgent.empty() ? "slim-s3/" SLIMS3_VERSION : cfg.userAgent;
     st->handle = curl_easy_init();
     state_ = st;
 }
@@ -362,6 +402,10 @@ int Transport::execute(const HttpRequest& req, HttpResponse& resp, std::atomic<b
         else
             curlError = "response body exceeded the 8 MiB in-memory cap";
     }
+    // Detach the stack errbuf from the handle before returning: the handle
+    // outlives this frame, and nothing may write into a dead frame's buffer
+    // (safe today only because curl_easy_reset clears it on the next call).
+    curl_easy_setopt(h, CURLOPT_ERRORBUFFER, nullptr);
     return int(rc);
 }
 

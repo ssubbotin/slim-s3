@@ -1,6 +1,8 @@
 #include <curl/curl.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <ctime>
 #include <fstream>
@@ -22,6 +24,22 @@
 namespace slims3 {
 
 using namespace detail;
+
+namespace {
+
+// Usage errors: rejected before any network I/O, same ErrorKind::transport
+// convention as the null-data and header-injection rejections in putObject.
+Result usageError(const char* msg) {
+    return Result{Error{ErrorKind::transport, 0, "", msg, 0}, 0};
+}
+
+std::string lowerCopy(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return char(std::tolower(c)); });
+    return s;
+}
+
+} // namespace
 
 namespace detail {
 
@@ -185,6 +203,8 @@ void Client::cancel() {
 Result Client::bucketExists(const std::string& bucket, bool& exists) {
     exists = false;
     impl_->cancel.store(false);
+    if (!validBucketName(bucket))
+        return usageError("invalid bucket name");
     Impl::Op op;
     op.method = "HEAD";
     op.bucket = bucket;
@@ -195,6 +215,9 @@ Result Client::bucketExists(const std::string& bucket, bool& exists) {
         exists = true;
         return r;
     }
+    // Checked before the error kind: a cancel() racing an already-received
+    // 404 reports the (factually correct) "does not exist" outcome instead of
+    // ErrorKind::cancelled -- the one deliberate exception to cancelled-wins.
     if (resp.status == 404) {
         exists = false;
         return Result{}; // definite "no" is a success
@@ -204,6 +227,8 @@ Result Client::bucketExists(const std::string& bucket, bool& exists) {
 
 Result Client::createBucket(const std::string& bucket) {
     impl_->cancel.store(false);
+    if (!validBucketName(bucket))
+        return usageError("invalid bucket name");
     Impl::Op op;
     op.method = "PUT";
     op.bucket = bucket;
@@ -218,6 +243,10 @@ Result Client::createBucket(const std::string& bucket) {
 
 Result Client::statObject(const std::string& bucket, const std::string& key, ObjectMeta& out) {
     impl_->cancel.store(false);
+    if (!validBucketName(bucket))
+        return usageError("invalid bucket name");
+    if (key.empty())
+        return usageError("empty object key");
     Impl::Op op;
     op.method = "HEAD";
     op.bucket = bucket;
@@ -234,6 +263,13 @@ Result Client::statObject(const std::string& bucket, const std::string& key, Obj
 
 Result Client::deleteObject(const std::string& bucket, const std::string& key) {
     impl_->cancel.store(false);
+    if (!validBucketName(bucket))
+        return usageError("invalid bucket name");
+    // Without this guard an empty key would send DELETE /{bucket} -- the
+    // DeleteBucket operation -- silently destroying the bucket instead of
+    // failing the (malformed) object delete.
+    if (key.empty())
+        return usageError("empty object key");
     Impl::Op op;
     op.method = "DELETE";
     op.bucket = bucket;
@@ -242,6 +278,7 @@ Result Client::deleteObject(const std::string& bucket, const std::string& key) {
     HttpResponse resp;
     Result r = impl_->run(op, resp);
     // S3 semantics: deleting a nonexistent key succeeds (some servers say 404).
+    // Same cancel/404 race note as bucketExists: the 404 outcome wins.
     if (!r && resp.status == 404)
         return Result{};
     return r;
@@ -250,6 +287,10 @@ Result Client::deleteObject(const std::string& bucket, const std::string& key) {
 Result Client::putObject(const std::string& bucket, const std::string& key, const void* data,
                          std::size_t len, const PutOptions& opts, const ProgressFn& progress) {
     impl_->cancel.store(false);
+    if (!validBucketName(bucket))
+        return usageError("invalid bucket name");
+    if (key.empty()) // an empty key would send PUT /{bucket} == CreateBucket
+        return usageError("empty object key");
     if (data == nullptr && len > 0)
         return Result{Error{ErrorKind::transport, 0, "", "null data with non-zero length", 0}, 0};
     // Reject header injection before it reaches the wire (and the signed
@@ -267,6 +308,31 @@ Result Client::putObject(const std::string& bucket, const std::string& key, cons
         if (!validHeaderToken(kv.first, /*isName=*/true) ||
             !validHeaderToken(kv.second, /*isName=*/false))
             return kInvalidHeader;
+    }
+    // Reject library-managed and duplicate header names. Overriding
+    // host/x-amz-date/... would corrupt the signature or request framing; and
+    // SigV4 requires a repeated header's values to be comma-joined under one
+    // name, so emitting a name twice (including Content-Type given both as
+    // the option and in extraHeaders) guarantees SignatureDoesNotMatch.
+    {
+        std::vector<std::string> names;
+        names.reserve(opts.extraHeaders.size() + 2);
+        if (!opts.contentType.empty())
+            names.push_back("content-type");
+        if (!opts.contentEncoding.empty())
+            names.push_back("content-encoding");
+        for (const auto& kv : opts.extraHeaders)
+            names.push_back(lowerCopy(kv.first));
+        static constexpr const char* kReserved[] = {
+            "host",           "authorization",     "x-amz-date", "x-amz-content-sha256",
+            "content-length", "transfer-encoding", "expect"};
+        for (const auto& n : names)
+            for (const char* rsv : kReserved)
+                if (n == rsv)
+                    return usageError("reserved header name (set by the library)");
+        std::sort(names.begin(), names.end());
+        if (std::adjacent_find(names.begin(), names.end()) != names.end())
+            return usageError("duplicate header name");
     }
     Impl::Op op;
     op.method = "PUT";
@@ -297,6 +363,12 @@ Result Client::putObject(const std::string& bucket, const std::string& key, cons
 Result Client::putFile(const std::string& bucket, const std::string& key,
                        const std::string& filePath, const PutOptions& opts,
                        const ProgressFn& progress) {
+    // Validate the target before touching the filesystem, so a bad bucket/key
+    // fails the same way regardless of whether filePath exists.
+    if (!validBucketName(bucket))
+        return usageError("invalid bucket name");
+    if (key.empty())
+        return usageError("empty object key");
     // v1 reads the whole file into memory (targets small/medium objects, and the
     // payload hash must cover the full body anyway). Local I/O failures are
     // reported as transport errors with curlCode == 0.
@@ -312,6 +384,10 @@ Result Client::putFile(const std::string& bucket, const std::string& key,
 Result Client::getObject(const std::string& bucket, const std::string& key, const WriteFn& sink,
                          const ProgressFn& progress, ObjectMeta* meta) {
     impl_->cancel.store(false);
+    if (!validBucketName(bucket))
+        return usageError("invalid bucket name");
+    if (key.empty()) // an empty key would stream the bucket listing XML into the sink
+        return usageError("empty object key");
     Impl::Op op;
     op.method = "GET";
     op.bucket = bucket;
@@ -329,6 +405,12 @@ Result Client::getObject(const std::string& bucket, const std::string& key, cons
 Result Client::getToFile(const std::string& bucket, const std::string& key,
                          const std::string& filePath, const ProgressFn& progress,
                          ObjectMeta* meta) {
+    // Validate before creating the temp file (getObject re-checks, but by then
+    // the .part file would already exist and need cleanup).
+    if (!validBucketName(bucket))
+        return usageError("invalid bucket name");
+    if (key.empty())
+        return usageError("empty object key");
     const std::string part = filePath + ".part";
 #ifdef _WIN32
     // v1 has no Windows equivalent of O_EXCL|O_NOFOLLOW handy; fall back to
@@ -363,6 +445,13 @@ Result Client::getToFile(const std::string& bucket, const std::string& key,
     };
     Result r = getObject(bucket, key, sink, progress, meta);
     bool flushOk = (std::fflush(f) == 0);
+#ifndef _WIN32
+    // fsync before the rename below: rename() is atomic in the namespace but
+    // does not flush data blocks, so without this a crash shortly after
+    // success could leave a truncated file under the final name.
+    if (r && flushOk && ::fsync(::fileno(f)) != 0)
+        flushOk = false;
+#endif
     std::fclose(f);
     if (r && flushOk) {
         if (std::rename(part.c_str(), filePath.c_str()) != 0) {
@@ -386,6 +475,8 @@ Result Client::getToFile(const std::string& bucket, const std::string& key,
 Result Client::listObjects(const std::string& bucket, const std::string& prefix, bool recursive,
                            const ListFn& onObject) {
     impl_->cancel.store(false);
+    if (!validBucketName(bucket))
+        return usageError("invalid bucket name");
     std::string token;
     // Hard cap on the number of ListObjectsV2 pages fetched for a single call:
     // a per-request timeout doesn't bound the whole (paginated) operation, and

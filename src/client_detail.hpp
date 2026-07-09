@@ -29,4 +29,24 @@ inline bool validHeaderToken(std::string_view s, bool isName) {
     return true;
 }
 
+// Rejects bucket names that would change the request target or corrupt the
+// URL vs the signed canonical URI: an empty name (operations would hit "/"),
+// a slash (silently retargets: bucket "b/x" becomes bucket "b", key "x"),
+// '?'/'#' (start the query/fragment early), '%' (ambiguous double-encoding),
+// spaces and control bytes. The accepted set [A-Za-z0-9._-] is deliberately a
+// superset of AWS's official [a-z0-9.-]: legacy buckets and some
+// S3-compatible stores allow uppercase and underscore; strictness beyond
+// URL/signature safety is the server's job.
+inline bool validBucketName(std::string_view b) {
+    if (b.empty())
+        return false;
+    for (unsigned char c : b) {
+        bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                  c == '-' || c == '.' || c == '_';
+        if (!ok)
+            return false;
+    }
+    return true;
+}
+
 } // namespace slims3::detail
